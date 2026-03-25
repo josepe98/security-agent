@@ -1149,6 +1149,191 @@ def check_js_secrets(session, base_url, stealth=False):
 
 
 # ─────────────────────────────────────────────
+# DATABASE KEY PROBING
+# ─────────────────────────────────────────────
+
+def _collect_js_text(session, base_url, stealth=False):
+    """Return a single string of all JS content (inline + up to 10 external files)."""
+    r = safe_get(session, base_url, stealth=stealth)
+    if not r:
+        return ""
+    parts = re.findall(r'<script[^>]*>(.*?)</script>', r.text, re.S | re.I)
+    js_urls = list(set(re.findall(r'<script[^>]+src=["\']([^"\']+\.js[^"\']*)["\']', r.text, re.I)))[:10]
+    for js in js_urls:
+        if js.startswith("http"):
+            abs_url = js
+        elif js.startswith("//"):
+            abs_url = "https:" + js
+        else:
+            abs_url = urllib.parse.urljoin(base_url, js)
+        jr = safe_get(session, abs_url, stealth=stealth)
+        if jr and jr.status_code == 200 and len(jr.content) <= 500_000:
+            parts.append(jr.text)
+    return "\n".join(parts)
+
+
+def check_db_keys(session, base_url, stealth=False):
+    """Extract Supabase/Firebase keys from client JS and probe whether they grant live DB access."""
+    results = []
+    all_js = _collect_js_text(session, base_url, stealth=stealth)
+    if not all_js:
+        results.append(finding("INFO", "DB Key Probe: Page Unreachable",
+            "Could not load page JS to scan for database keys."))
+        return results
+
+    probed = []
+
+    # ── Supabase ──
+    # Primary: extract URL + key from createClient("https://xxx.supabase.co", "eyJ...")
+    supabase_pairs = re.findall(
+        r'createClient\s*\(\s*["\']?(https://[a-z0-9]+\.supabase\.co)["\']?\s*,\s*["\']?(eyJ[A-Za-z0-9_\-\.]{20,})["\']?',
+        all_js, re.I
+    )
+    # Fallback: separate URL and key assignments
+    if not supabase_pairs:
+        url_m = re.search(r'["\']?(https://[a-z0-9]+\.supabase\.co)["\']?', all_js)
+        key_m = re.search(
+            r'(?:supabase[_\-]?anon[_\-]?key|anon[_\-]?key|supabaseKey)\s*[=:]\s*["\']?(eyJ[A-Za-z0-9_\-\.]{20,})["\']?',
+            all_js, re.I)
+        if url_m and key_m:
+            supabase_pairs = [(url_m.group(1), key_m.group(1))]
+
+    for supabase_url, anon_key in supabase_pairs[:2]:
+        try:
+            headers = {"apikey": anon_key, "Authorization": f"Bearer {anon_key}"}
+            # Hit the PostgREST root — returns OpenAPI spec listing all exposed tables
+            root_resp = session.get(
+                supabase_url.rstrip("/") + "/rest/v1/",
+                headers=headers, timeout=TIMEOUT, verify=False)
+
+            if root_resp.status_code == 401:
+                probed.append(("PASS", "Supabase Anon Key Rejected",
+                    "Anon key found in client JS was rejected (401) by the database API.",
+                    None, f"Project: {supabase_url}"))
+                continue
+
+            if root_resp.status_code != 200:
+                continue
+
+            try:
+                spec = root_resp.json()
+            except Exception:
+                continue
+
+            table_paths = [p.lstrip("/") for p in spec.get("paths", {}) if p not in ("/", "")]
+            if not table_paths:
+                probed.append(("PASS", "Supabase Anon Key: No Tables Exposed",
+                    "Anon key accepted but no readable tables found in API spec.",
+                    None, f"Project: {supabase_url}"))
+                continue
+
+            # Try to read one row from the first listed table
+            table = table_paths[0]
+            row_resp = session.get(
+                f"{supabase_url.rstrip('/')}/rest/v1/{table}?select=*&limit=1",
+                headers=headers, timeout=TIMEOUT, verify=False)
+
+            if row_resp.status_code == 200:
+                try:
+                    data = row_resp.json()
+                except Exception:
+                    data = None
+                if isinstance(data, list):
+                    probed.append(("CRITICAL", "Supabase Anon Key Grants Database Read Access",
+                        f"Anon key from client JS successfully read table '{table}' ({len(data)} row(s) returned). "
+                        "Row Level Security (RLS) is disabled or overly permissive.",
+                        "Enable RLS on all Supabase tables. Anon keys are intentionally public — "
+                        "RLS is the only thing preventing public data access.",
+                        f"Table: {table} | Rows returned: {len(data)} | Key: {anon_key[:24]}..."))
+                else:
+                    probed.append(("HIGH", "Supabase Anon Key Accepted (Unexpected Response)",
+                        f"Anon key authenticated against {supabase_url} but table read returned unexpected format.",
+                        "Manually verify RLS is enabled on all tables.",
+                        f"Key: {anon_key[:24]}..."))
+            elif row_resp.status_code == 401:
+                probed.append(("PASS", "Supabase RLS Active",
+                    f"Anon key accepted by API but table '{table}' read returned 401 — RLS is enforced.",
+                    None, f"Project: {supabase_url}"))
+        except Exception:
+            pass
+
+    # ── Firebase Realtime Database ──
+    firebase_db_urls = re.findall(
+        r'databaseURL\s*[=:]\s*["\']?(https://[a-z0-9\-]+\.firebaseio\.com)["\']?',
+        all_js, re.I)
+
+    for db_url in firebase_db_urls[:2]:
+        try:
+            resp = session.get(db_url.rstrip("/") + "/.json", timeout=TIMEOUT, verify=False)
+            if resp.status_code == 200:
+                try:
+                    data = resp.json()
+                except Exception:
+                    data = None
+                if data is not None:
+                    probed.append(("CRITICAL", "Firebase Realtime Database Publicly Readable",
+                        f"Unauthenticated GET to {db_url}/.json returned data — security rules allow public read.",
+                        'Set Firebase rules to require auth: { "rules": { ".read": "auth != null", ".write": "auth != null" } }',
+                        str(data)[:120]))
+                else:
+                    probed.append(("PASS", "Firebase Realtime Database Returns Null",
+                        "Unauthenticated read returned null — database is empty or rules restrict access.",
+                        None, db_url))
+            elif resp.status_code in (401, 403):
+                probed.append(("PASS", "Firebase Realtime Database Correctly Restricted",
+                    f"Unauthenticated read to {db_url}/.json returned {resp.status_code} — rules require auth.",
+                    None, db_url))
+        except Exception:
+            pass
+
+    # ── Firestore ──
+    project_ids = re.findall(r'projectId\s*[=:]\s*["\']([a-z0-9\-]+)["\']', all_js, re.I)
+
+    for project_id in project_ids[:2]:
+        try:
+            fs_url = f"https://firestore.googleapis.com/v1/projects/{project_id}/databases/(default)/documents"
+            resp = session.get(fs_url, timeout=TIMEOUT, verify=False)
+            if resp.status_code == 200:
+                try:
+                    data = resp.json()
+                    docs = data.get("documents", [])
+                except Exception:
+                    docs = []
+                if docs:
+                    probed.append(("CRITICAL", "Firestore Database Publicly Readable",
+                        f"Unauthenticated GET to Firestore project '{project_id}' returned {len(docs)} document(s). "
+                        "Security rules allow public read.",
+                        "Set Firestore security rules to require authentication on all collections.",
+                        f"Project: {project_id} | Documents at root: {len(docs)}"))
+                else:
+                    probed.append(("PASS", "Firestore: No Documents at Root",
+                        "Unauthenticated Firestore read returned no documents at root — rules may still be open on subcollections.",
+                        "Verify Firestore rules explicitly deny unauthenticated reads on all collections.",
+                        f"Project: {project_id}"))
+            elif resp.status_code in (401, 403):
+                probed.append(("PASS", "Firestore Correctly Restricted",
+                    f"Unauthenticated Firestore read returned {resp.status_code} — rules require auth.",
+                    None, f"Project: {project_id}"))
+        except Exception:
+            pass
+
+    if not supabase_pairs and not firebase_db_urls and not project_ids:
+        results.append(finding("PASS", "No Database Keys Detected",
+            "No Supabase or Firebase database configuration found in client-side JS."))
+        return results
+
+    if not probed:
+        results.append(finding("INFO", "Database Keys Found but Probes Inconclusive",
+            "Database configuration was detected in JS but live probes failed or timed out."))
+        return results
+
+    for severity, title, detail, rec, evidence in probed:
+        results.append(finding(severity, title, detail, rec, evidence))
+
+    return results
+
+
+# ─────────────────────────────────────────────
 # DNS RECONNAISSANCE  (bypasses WAF entirely)
 # ─────────────────────────────────────────────
 
@@ -2098,7 +2283,7 @@ def scan_url(url, active=False, stealth=False, use_playwright=False):
     session = get_session()
     results_by_category = {}
 
-    passive_total = 11 + (1 if use_playwright else 0)
+    passive_total = 12 + (1 if use_playwright else 0)
     total = passive_total + (4 if active else 0)
 
     # 1. SSL/TLS
@@ -2134,45 +2319,49 @@ def scan_url(url, active=False, stealth=False, use_playwright=False):
     print(f"    [ 6/{total}] JavaScript secret scanning...")
     results_by_category["JavaScript Secrets"] = check_js_secrets(session, url, stealth=stealth)
 
+    # 7. Database key probing (Supabase anon key, Firebase)
+    print(f"    [ 7/{total}] Database key probing...")
+    results_by_category["Database Keys"] = check_db_keys(session, url, stealth=stealth)
+
     # SPA catch-all detection (avoids false positives on path probes)
     spa_baseline = detect_spa_baseline(session, url)
     if spa_baseline[0] is not None:
         print(f"    [info] SPA catch-all detected — will validate path probe results")
 
-    # 7. Sensitive files
-    print(f"    [ 7/{total}] Sensitive file exposure...")
+    # 8. Sensitive files
+    print(f"    [ 8/{total}] Sensitive file exposure...")
     results_by_category["Sensitive Files"] = check_sensitive_files(session, url, spa_baseline=spa_baseline)
 
-    # 8. Admin panels
-    print(f"    [ 8/{total}] Admin panel discovery...")
+    # 9. Admin panels
+    print(f"    [ 9/{total}] Admin panel discovery...")
     results_by_category["Admin Panels"] = check_admin_panels(session, url, spa_baseline=spa_baseline)
 
-    # 9. API security
-    print(f"    [ 9/{total}] API endpoint checks...")
+    # 10. API security
+    print(f"    [10/{total}] API endpoint checks...")
     results_by_category["API Security"] = check_api_endpoints(session, url, spa_baseline=spa_baseline)
 
-    # 10. Authentication
-    print(f"    [10/{total}] Authentication checks...")
+    # 11. Authentication
+    print(f"    [11/{total}] Authentication checks...")
     results_by_category["Authentication"] = check_authentication(session, url)
 
-    # 11. Mixed content
-    print(f"    [11/{total}] Mixed content...")
+    # 12. Mixed content
+    print(f"    [12/{total}] Mixed content...")
     mc = check_mixed_content(session, url)
     if mc:
         results_by_category["Mixed Content"] = mc
 
     # ── Active checks (opt-in) ──
     if active:
-        print(f"    [12/{total}] Injection checks (SQL error-based, XSS, template)...")
+        print(f"    [13/{total}] Injection checks (SQL error-based, XSS, template)...")
         results_by_category["Injection Testing"] = check_injection(session, url)
 
-        print(f"    [13/{total}] Blind time-based SQL injection...")
+        print(f"    [14/{total}] Blind time-based SQL injection...")
         results_by_category["Blind SQL Injection"] = check_blind_sqli(session, url, stealth=stealth)
 
-        print(f"    [14/{total}] Open redirect testing...")
+        print(f"    [15/{total}] Open redirect testing...")
         results_by_category["Open Redirect"] = check_open_redirect(session, url, stealth=stealth)
 
-        print(f"    [15/{total}] Brute force / account lockout testing...")
+        print(f"    [16/{total}] Brute force / account lockout testing...")
         results_by_category["Brute Force Protection"] = check_brute_force(session, url, stealth=stealth)
 
     # ── Playwright headless browser scan (opt-in) ──
