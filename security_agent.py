@@ -5,6 +5,8 @@ Performs passive security checks on websites and generates an interactive HTML r
 Usage: python security_agent.py <url1> [url2] [url3] ...
 """
 
+__version__ = "1.3.0"
+
 import sys
 import ssl
 import socket
@@ -2529,7 +2531,7 @@ def generate_html_report(scan_results, output_path):
     <div class="meta">Generated: {report_time} &nbsp;|&nbsp; {len(scan_results)} site(s) scanned</div>
   </div>
   <div class="meta" style="text-align:right">
-    Security Agent v1.0
+    Security Agent v{__version__}
   </div>
 </header>
 
