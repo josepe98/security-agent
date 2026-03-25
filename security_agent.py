@@ -5,7 +5,7 @@ Performs passive security checks on websites and generates an interactive HTML r
 Usage: python security_agent.py <url1> [url2] [url3] ...
 """
 
-__version__ = "1.4.0"
+__version__ = "1.5.0"
 
 import sys
 import ssl
@@ -1369,7 +1369,147 @@ def check_db_keys(session, base_url, stealth=False, detected_tech=None):
         except Exception:
             pass
 
-    if not supabase_pairs and not firebase_db_urls and not project_ids:
+    # ── Hasura ──
+    # Look for GraphQL endpoint + admin secret
+    hasura_endpoints = re.findall(
+        r'["\']?(https://[a-z0-9\-]+\.hasura\.(?:app|io)/v\d+/graphql)["\']?',
+        all_js, re.I)
+    # Also catch self-hosted Hasura endpoints referenced alongside an admin secret
+    if not hasura_endpoints:
+        ep_m = re.search(r'["\']?(https?://[^\s"\']+/v\d+/graphql)["\']?', all_js, re.I)
+        sec_m = re.search(
+            r'(?:hasura[_\-]?admin[_\-]?secret|x-hasura-admin-secret)\s*[=:]\s*["\']([^"\']{8,})["\']',
+            all_js, re.I)
+        if ep_m and sec_m:
+            hasura_endpoints = [ep_m.group(1)]
+
+    hasura_secret_m = re.search(
+        r'(?:hasura[_\-]?admin[_\-]?secret|x-hasura-admin-secret)\s*[=:]\s*["\']([^"\']{8,})["\']',
+        all_js, re.I)
+    hasura_secret = hasura_secret_m.group(1) if hasura_secret_m else None
+
+    introspect_query = '{"query":"{ __schema { queryType { name } } }"}'
+
+    for ep in hasura_endpoints[:2]:
+        try:
+            # First: probe unauthenticated — if schema comes back, endpoint is fully public
+            anon_resp = session.post(ep, data=introspect_query,
+                headers={"Content-Type": "application/json"},
+                timeout=TIMEOUT, verify=False)
+            if anon_resp.status_code == 200:
+                try:
+                    anon_data = anon_resp.json()
+                except Exception:
+                    anon_data = {}
+                if anon_data.get("data"):
+                    probed.append(("CRITICAL", "Hasura GraphQL Endpoint Publicly Accessible",
+                        f"Unauthenticated introspection query to {ep} returned schema data — "
+                        "the endpoint requires no authentication.",
+                        "Restrict the Hasura endpoint with an admin secret and disable "
+                        "introspection in production (HASURA_GRAPHQL_ENABLE_INTROSPECTION=false).",
+                        f"Endpoint: {ep}"))
+                    continue
+
+            # Second: probe with admin secret if found in JS
+            if hasura_secret:
+                auth_resp = session.post(ep, data=introspect_query,
+                    headers={"Content-Type": "application/json",
+                             "x-hasura-admin-secret": hasura_secret},
+                    timeout=TIMEOUT, verify=False)
+                if auth_resp.status_code == 200:
+                    try:
+                        auth_data = auth_resp.json()
+                    except Exception:
+                        auth_data = {}
+                    if auth_data.get("data"):
+                        probed.append(("CRITICAL", "Hasura Admin Secret Exposed in Client JS",
+                            f"Admin secret found in client-side JS grants full GraphQL access to {ep}.",
+                            "Remove the admin secret from client code immediately. Use role-based "
+                            "JWT auth for client-facing queries. Rotate the admin secret.",
+                            f"Endpoint: {ep} | Secret: {hasura_secret[:12]}..."))
+                    else:
+                        probed.append(("PASS", "Hasura Admin Secret Found but Endpoint Rejected It",
+                            "Admin secret was found in JS but did not authenticate successfully.",
+                            None, f"Endpoint: {ep}"))
+                elif auth_resp.status_code in (401, 403):
+                    probed.append(("HIGH", "Hasura Admin Secret in Client JS (Auth Confirmed)",
+                        f"Admin secret found in client-side JS. The endpoint rejected it (possibly "
+                        "IP-restricted), but the secret itself should not be in browser code.",
+                        "Remove the admin secret from client code and rotate it.",
+                        f"Secret: {hasura_secret[:12]}..."))
+        except Exception:
+            pass
+
+    # ── Xata ──
+    xata_keys = re.findall(r'xau_[A-Za-z0-9_\-]{20,}', all_js)
+
+    for key in xata_keys[:2]:
+        try:
+            resp = session.get("https://api.xata.io/workspaces",
+                headers={"Authorization": f"Bearer {key}",
+                         "Content-Type": "application/json"},
+                timeout=TIMEOUT, verify=False)
+            if resp.status_code == 200:
+                try:
+                    workspaces = resp.json().get("workspaces", [])
+                except Exception:
+                    workspaces = []
+                probed.append(("CRITICAL", "Xata API Key Grants Workspace Access",
+                    f"API key found in client JS successfully authenticated to Xata and returned "
+                    f"{len(workspaces)} workspace(s). This key can read and write database records.",
+                    "Xata API keys are server-side credentials — remove from client code, "
+                    "rotate the key, and use Xata's user-scoped auth for browser clients.",
+                    f"Key: {key[:16]}... | Workspaces: {len(workspaces)}"))
+            elif resp.status_code in (401, 403):
+                probed.append(("PASS", "Xata API Key Rejected",
+                    "Xata API key found in client JS but was rejected by the API.",
+                    None, f"Key: {key[:16]}..."))
+        except Exception:
+            pass
+
+    # ── Turso ──
+    # URL forms: libsql://xxx.turso.io  or  https://xxx.turso.io
+    turso_urls = re.findall(
+        r'(?:libsql|https?)://([a-z0-9\-]+\.turso\.io)',
+        all_js, re.I)
+
+    for db_host in turso_urls[:2]:
+        # Auth token: JWT near the Turso URL in JS
+        for m in re.finditer(re.escape(db_host), all_js, re.I):
+            window = all_js[max(0, m.start() - 400): m.end() + 400]
+            jwt_m = re.search(
+                r'eyJ[A-Za-z0-9_\-]{20,}\.[A-Za-z0-9_\-]{20,}\.[A-Za-z0-9_\-]{10,}',
+                window)
+            if not jwt_m:
+                continue
+            token = jwt_m.group(0)
+            try:
+                probe_url = f"https://{db_host}/v2/pipeline"
+                resp = session.post(probe_url,
+                    json={"requests": [{"type": "execute", "stmt": {"sql": "SELECT 1"}}]},
+                    headers={"Authorization": f"Bearer {token}",
+                             "Content-Type": "application/json"},
+                    timeout=TIMEOUT, verify=False)
+                if resp.status_code == 200:
+                    probed.append(("CRITICAL", "Turso Auth Token Grants Database Access",
+                        f"Auth token found in client JS successfully executed a query against "
+                        f"{db_host}. Any SQL readable by this token is exposed.",
+                        "Turso auth tokens are server-side credentials — remove from client code "
+                        "and rotate the token. Use Turso's embedded replicas or edge functions "
+                        "to avoid shipping tokens to the browser.",
+                        f"Host: {db_host} | Token: {token[:24]}..."))
+                elif resp.status_code in (401, 403):
+                    probed.append(("PASS", "Turso Token Rejected",
+                        f"Turso auth token found in client JS but was rejected by {db_host}.",
+                        None, f"Host: {db_host}"))
+            except Exception:
+                pass
+            break  # one token per host is enough
+
+    nothing_found = (not supabase_pairs and not firebase_db_urls and not project_ids
+                     and not hasura_endpoints and not xata_keys and not turso_urls)
+
+    if nothing_found:
         if supabase_expected:
             results.append(finding("MEDIUM", "Supabase Detected but Anon Key Not Found in JS",
                 "Supabase was identified via fingerprinting but no anon key could be extracted from "
@@ -1384,7 +1524,7 @@ def check_db_keys(session, base_url, stealth=False, detected_tech=None):
                 "Manually verify Firebase security rules require authentication."))
         else:
             results.append(finding("PASS", "No Database Keys Detected",
-                "No Supabase or Firebase database configuration found in client-side JS."))
+                "No Supabase, Firebase, Hasura, Xata, or Turso credentials found in client-side JS."))
         return results
 
     if not probed:
