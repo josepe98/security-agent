@@ -654,17 +654,31 @@ def check_api_endpoints(session, base_url, spa_baseline=None):
         results.append(finding("PASS", "No Common API Endpoints Exposed",
             "No common API paths returned accessible responses."))
 
-    # Check for rate limiting headers on main page
-    r = safe_get(session, base_url)
-    if r:
-        rate_headers = [h for h in r.headers if "rate" in h.lower() or "retry" in h.lower() or "x-ratelimit" in h.lower()]
+    # Check for rate limiting headers on auth/API endpoints (not homepage)
+    rate_check_paths = ["/api/auth/login", "/auth/login", "/api/login", "/login", "/api/token"]
+    rate_checked_url = None
+    rate_headers = []
+    for path in rate_check_paths:
+        candidate = base_url.rstrip("/") + path
+        r = safe_get(session, candidate)
+        if r and r.status_code != 404:
+            rate_headers = [h for h in r.headers if "rate" in h.lower() or "retry" in h.lower() or "x-ratelimit" in h.lower()]
+            rate_checked_url = candidate
+            break
+    if not rate_checked_url:
+        # Fall back to homepage if no auth endpoint found
+        r = safe_get(session, base_url)
+        if r:
+            rate_headers = [h for h in r.headers if "rate" in h.lower() or "retry" in h.lower() or "x-ratelimit" in h.lower()]
+            rate_checked_url = base_url
+    if rate_checked_url:
         if not rate_headers:
             results.append(finding("LOW", "No Rate Limiting Headers Detected",
-                "No rate limiting headers found on the main response.",
+                f"No rate limiting headers found on {rate_checked_url}.",
                 "Implement rate limiting on login endpoints and APIs (e.g., X-RateLimit-* headers)."))
         else:
             results.append(finding("PASS", "Rate Limiting Headers Present",
-                f"Headers: {', '.join(rate_headers)}"))
+                f"Headers on {rate_checked_url}: {', '.join(rate_headers)}"))
 
     if spa_suppressed:
         results.append(finding("INFO", f"SPA Catch-All: {spa_suppressed} API path(s) suppressed",
@@ -705,14 +719,27 @@ def check_authentication(session, base_url):
             results.append(finding("PASS", "Password Autocomplete Appears Controlled",
                 "No obvious autocomplete='on' found on password fields."))
 
-        # Check for CSRF token
-        if not re.search(r'(csrf|_token|nonce|authenticity)', html, re.I):
-            results.append(finding("MEDIUM", "No CSRF Token Detected in Login Form",
-                "No CSRF token pattern found in login page HTML.",
-                "Add CSRF tokens to all state-changing forms."))
+        # Check for CSRF token — skip if site uses stateless JWT Bearer auth (no session cookies)
+        try:
+            probe = session.head(url, timeout=TIMEOUT, verify=False, allow_redirects=True)
+            has_session_cookie = any(
+                c for c in probe.cookies
+                if any(kw in c.name.lower() for kw in ("session", "sess", "sid", "auth", "token"))
+            )
+        except Exception:
+            has_session_cookie = True  # assume cookie-based if we can't tell
+        if has_session_cookie:
+            if not re.search(r'(csrf|_token|nonce|authenticity)', html, re.I):
+                results.append(finding("MEDIUM", "No CSRF Token Detected in Login Form",
+                    "No CSRF token pattern found in login page HTML.",
+                    "Add CSRF tokens to all state-changing forms."))
+            else:
+                results.append(finding("PASS", "CSRF Token Pattern Detected",
+                    "A CSRF token or nonce pattern was found in the login page."))
         else:
-            results.append(finding("PASS", "CSRF Token Pattern Detected",
-                "A CSRF token or nonce pattern was found in the login page."))
+            results.append(finding("PASS", "CSRF Not Applicable (Stateless Auth)",
+                "No session cookies detected — site appears to use stateless JWT Bearer auth, "
+                "which is not vulnerable to CSRF."))
 
         # Check for 2FA / MFA signals (SECURITY.md §1b)
         twofa_text_signals = [
@@ -2477,12 +2504,18 @@ def main():
              "Discovers forms invisible to plain HTTP requests, checks localStorage/sessionStorage, "
              "window globals, and HTML comments for secrets. Combine with --active to test found inputs."
     )
+    parser.add_argument(
+        "--skip", metavar="FINDING", action="append", default=[],
+        help="Suppress a finding by a keyword match against its title (case-insensitive). "
+             "Can be repeated: --skip csrf --skip 2fa --skip 'rate limit'"
+    )
     args = parser.parse_args()
 
     urls = args.urls
     active = args.active
     stealth = args.stealth
     use_playwright = args.playwright
+    skip_keywords = [k.lower() for k in args.skip]
 
     print(f"\n🛡  Web Security Agent")
     if active:
@@ -2491,12 +2524,20 @@ def main():
         print(f"   🕵  Stealth mode ENABLED (slower, quieter)")
     if use_playwright:
         print(f"   🌐 Playwright headless browser ENABLED")
+    if skip_keywords:
+        print(f"   ⏭  Skipping findings matching: {', '.join(skip_keywords)}")
     print(f"   Scanning {len(urls)} site(s)...\n")
 
     scan_results = []
     for url in urls:
         try:
             result = scan_url(url, active=active, stealth=stealth, use_playwright=use_playwright)
+            if skip_keywords:
+                for cat in result["categories"]:
+                    result["categories"][cat] = [
+                        f for f in result["categories"][cat]
+                        if not any(kw in f["title"].lower() for kw in skip_keywords)
+                    ]
             score, grade, counts = compute_score(result["categories"])
             scan_results.append(result)
             print(f"     Score: {score}/100  Grade: {grade}  "
