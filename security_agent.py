@@ -5,7 +5,7 @@ Performs passive security checks on websites and generates an interactive HTML r
 Usage: python security_agent.py <url1> [url2] [url3] ...
 """
 
-__version__ = "1.3.0"
+__version__ = "1.4.0"
 
 import sys
 import ssl
@@ -1154,28 +1154,70 @@ def check_js_secrets(session, base_url, stealth=False):
 # DATABASE KEY PROBING
 # ─────────────────────────────────────────────
 
-def _collect_js_text(session, base_url, stealth=False):
-    """Return a single string of all JS content (inline + up to 10 external files)."""
+def _collect_js_text(session, base_url, stealth=False, size_limit=500_000):
+    """Return a single string of all JS content (inline + external files).
+
+    For Next.js sites the initial HTML often contains very few <script src> tags —
+    the real bundles live under /_next/static/chunks/.  We probe those paths
+    explicitly so framework-bundled secrets are not missed.
+    """
     r = safe_get(session, base_url, stealth=stealth)
     if not r:
         return ""
     parts = re.findall(r'<script[^>]*>(.*?)</script>', r.text, re.S | re.I)
-    js_urls = list(set(re.findall(r'<script[^>]+src=["\']([^"\']+\.js[^"\']*)["\']', r.text, re.I)))[:10]
-    for js in js_urls:
+
+    # Collect all <script src> URLs from the page
+    js_urls = list(set(re.findall(r'<script[^>]+src=["\']([^"\']+\.js[^"\']*)["\']', r.text, re.I)))
+
+    # Next.js: also probe common chunk paths that may not appear in the initial HTML
+    parsed = urllib.parse.urlparse(base_url)
+    next_root = f"{parsed.scheme}://{parsed.netloc}"
+    # The buildId is embedded in __NEXT_DATA__ — extract it if present
+    build_id_m = re.search(r'"buildId"\s*:\s*"([^"]+)"', r.text)
+    if build_id_m:
+        build_id = build_id_m.group(1)
+        js_urls += [
+            f"/_next/static/{build_id}/_buildManifest.js",
+            f"/_next/static/chunks/pages/_app.js",
+            f"/_next/static/chunks/pages/index.js",
+        ]
+    # Probe the chunks directory listing heuristic (common filenames)
+    js_urls += [
+        "/_next/static/chunks/main.js",
+        "/_next/static/chunks/webpack.js",
+        "/_next/static/chunks/framework.js",
+        "/_next/static/chunks/pages/_app.js",
+    ]
+
+    seen = set()
+    for js in js_urls[:20]:
         if js.startswith("http"):
             abs_url = js
         elif js.startswith("//"):
             abs_url = "https:" + js
         else:
             abs_url = urllib.parse.urljoin(base_url, js)
+        if abs_url in seen:
+            continue
+        seen.add(abs_url)
         jr = safe_get(session, abs_url, stealth=stealth)
-        if jr and jr.status_code == 200 and len(jr.content) <= 500_000:
+        if not jr or jr.status_code != 200:
+            continue
+        # For large files, still search — but only keep if they contain a Supabase/Firebase signal
+        if len(jr.content) > size_limit:
+            if re.search(r'supabase\.co|firebaseio\.com|firebaseapp\.com', jr.text):
+                parts.append(jr.text)
+        else:
             parts.append(jr.text)
     return "\n".join(parts)
 
 
-def check_db_keys(session, base_url, stealth=False):
+def check_db_keys(session, base_url, stealth=False, detected_tech=None):
     """Extract Supabase/Firebase keys from client JS and probe whether they grant live DB access."""
+    detected_tech = detected_tech or set()
+    supabase_expected = "Supabase" in detected_tech
+    firebase_expected = "Firebase" in detected_tech
+
     results = []
     all_js = _collect_js_text(session, base_url, stealth=stealth)
     if not all_js:
@@ -1186,12 +1228,12 @@ def check_db_keys(session, base_url, stealth=False):
     probed = []
 
     # ── Supabase ──
-    # Primary: extract URL + key from createClient("https://xxx.supabase.co", "eyJ...")
+    # Pass 1: createClient("https://xxx.supabase.co", "eyJ...") — intact source
     supabase_pairs = re.findall(
         r'createClient\s*\(\s*["\']?(https://[a-z0-9]+\.supabase\.co)["\']?\s*,\s*["\']?(eyJ[A-Za-z0-9_\-\.]{20,})["\']?',
         all_js, re.I
     )
-    # Fallback: separate URL and key assignments
+    # Pass 2: named variable assignments (common in env-var patterns)
     if not supabase_pairs:
         url_m = re.search(r'["\']?(https://[a-z0-9]+\.supabase\.co)["\']?', all_js)
         key_m = re.search(
@@ -1199,6 +1241,14 @@ def check_db_keys(session, base_url, stealth=False):
             all_js, re.I)
         if url_m and key_m:
             supabase_pairs = [(url_m.group(1), key_m.group(1))]
+    # Pass 3: co-occurrence — any JWT within 300 chars of a supabase.co URL (handles minified bundles)
+    if not supabase_pairs:
+        for m in re.finditer(r'https://([a-z0-9]+)\.supabase\.co', all_js, re.I):
+            window = all_js[max(0, m.start() - 300): m.end() + 300]
+            jwt_m = re.search(r'eyJ[A-Za-z0-9_\-]{20,}\.[A-Za-z0-9_\-]{20,}\.[A-Za-z0-9_\-]{10,}', window)
+            if jwt_m:
+                supabase_pairs = [(m.group(0), jwt_m.group(0))]
+                break
 
     for supabase_url, anon_key in supabase_pairs[:2]:
         try:
@@ -1320,8 +1370,21 @@ def check_db_keys(session, base_url, stealth=False):
             pass
 
     if not supabase_pairs and not firebase_db_urls and not project_ids:
-        results.append(finding("PASS", "No Database Keys Detected",
-            "No Supabase or Firebase database configuration found in client-side JS."))
+        if supabase_expected:
+            results.append(finding("MEDIUM", "Supabase Detected but Anon Key Not Found in JS",
+                "Supabase was identified via fingerprinting but no anon key could be extracted from "
+                "client-side JS. The key may be in a large bundle that was not fully scanned, loaded "
+                "via a service worker, or injected at runtime.",
+                "Manually verify RLS is enabled on all tables. Check network requests in DevTools "
+                "for the Authorization header to confirm the anon key in use."))
+        elif firebase_expected:
+            results.append(finding("MEDIUM", "Firebase Detected but Config Not Found in JS",
+                "Firebase was identified via fingerprinting but no API key or project config could "
+                "be extracted from client-side JS.",
+                "Manually verify Firebase security rules require authentication."))
+        else:
+            results.append(finding("PASS", "No Database Keys Detected",
+                "No Supabase or Firebase database configuration found in client-side JS."))
         return results
 
     if not probed:
@@ -2323,7 +2386,7 @@ def scan_url(url, active=False, stealth=False, use_playwright=False):
 
     # 7. Database key probing (Supabase anon key, Firebase)
     print(f"    [ 7/{total}] Database key probing...")
-    results_by_category["Database Keys"] = check_db_keys(session, url, stealth=stealth)
+    results_by_category["Database Keys"] = check_db_keys(session, url, stealth=stealth, detected_tech=detected_tech)
 
     # SPA catch-all detection (avoids false positives on path probes)
     spa_baseline = detect_spa_baseline(session, url)
