@@ -16,6 +16,7 @@ import time
 import re
 import uuid
 import random
+import hashlib
 import urllib.parse
 import argparse
 from pathlib import Path
@@ -451,28 +452,41 @@ def check_https_redirect(session, url):
 
 def detect_spa_baseline(session, base_url):
     """Fetch a random nonsense path to detect SPA catch-all routing.
-    Returns (body_text, content_length) if the site returns 200 for unknown paths,
-    or (None, None) if the site properly returns 404."""
-    random_slug = uuid.uuid4().hex[:16]
-    canary_url = base_url.rstrip("/") + f"/__spa_detect_{random_slug}"
+    Returns (body_text, content_length, body_hash, content_type) if the site returns 200
+    for unknown paths, or (None, None, None, None) if it properly returns 404."""
+    canary_url = base_url.rstrip("/") + f"/{uuid.uuid4()}"
     r = safe_get(session, canary_url)
     if r is not None and r.status_code == 200 and len(r.content) > 0:
-        return r.text, len(r.content)
-    return None, None
+        body_hash = hashlib.sha1(r.content).hexdigest()
+        content_type = r.headers.get("Content-Type", "")
+        return r.text, len(r.content), body_hash, content_type
+    return None, None, None, None
 
 
-def _matches_spa_baseline(response_text, response_size, spa_baseline_text, spa_baseline_size):
-    """Check if a response looks like the SPA catch-all page."""
-    if spa_baseline_text is None:
+def _matches_spa_baseline(response_text, response_size, spa_baseline, response_ct=None):
+    """Check if a response looks like the SPA catch-all page.
+
+    spa_baseline: 4-tuple (body_text, content_length, body_hash, content_type) as returned
+    by detect_spa_baseline(), or None if no catch-all was detected.
+    """
+    if spa_baseline is None or spa_baseline[0] is None:
         return False
-    # Same size is a strong signal; also check content similarity
-    if response_size == spa_baseline_size:
-        return True
-    # Allow small size variance (e.g. injected nonce differences) and check text overlap
-    if abs(response_size - spa_baseline_size) < 50:
-        # Compare first 200 chars — SPA shells are nearly identical
-        if response_text[:200] == spa_baseline_text[:200]:
+    spa_text, spa_size, spa_hash, spa_ct = spa_baseline
+    # Hash match — identical response body, strongest possible signal
+    if spa_hash:
+        response_hash = hashlib.sha1(response_text.encode("utf-8", errors="replace")).hexdigest()
+        if response_hash == spa_hash:
             return True
+    # Size + content_type match — probable catch-all even with minor dynamic differences
+    if response_size == spa_size and response_ct and spa_ct:
+        if response_ct.split(";")[0].strip().lower() == spa_ct.split(";")[0].strip().lower():
+            return True
+    # Size alone is a strong signal
+    if response_size == spa_size:
+        return True
+    # Small size variance with matching prefix — e.g. nonce injected into the same shell
+    if abs(response_size - spa_size) < 50 and response_text[:200] == spa_text[:200]:
+        return True
     return False
 
 
@@ -480,6 +494,11 @@ BINARY_ARCHIVE_EXTENSIONS = (".zip", ".tar.gz", ".tar", ".gz", ".tgz", ".bz2")
 BINARY_ARCHIVE_CONTENT_TYPES = ("application/zip", "application/x-tar", "application/gzip",
                                  "application/x-gzip", "application/x-bzip2",
                                  "application/octet-stream", "application/x-compressed")
+# Extensions that can never legitimately return text/html — if they do, it's a catch-all
+NONHTML_EXTENSIONS = (".backup", ".bak", ".sql", ".env", ".zip", ".tar.gz", ".tar",
+                      ".gz", ".tgz", ".bz2", ".db", ".sqlite", ".dump")
+# Body patterns that indicate an SPA shell rather than a real file
+SPA_BODY_MARKERS = ('<div id="root">', '<div id="app">', '<script type="module"')
 
 
 def _content_confirms_sensitive_file(path, response_text, content_type=None):
@@ -501,7 +520,6 @@ def _content_confirms_sensitive_file(path, response_text, content_type=None):
 def check_sensitive_files(session, base_url, spa_baseline=None):
     results = []
     exposed = []
-    spa_text, spa_size = spa_baseline or (None, None)
     spa_suppressed = 0
 
     for path in SENSITIVE_PATHS:
@@ -513,17 +531,29 @@ def check_sensitive_files(session, base_url, spa_baseline=None):
             # Make sure it's not a soft 404
             content = r.text[:200].lower()
             if "not found" not in content and "404" not in content:
-                # SPA catch-all detection: skip if response matches the baseline
                 ct = r.headers.get("Content-Type", "")
-                if _matches_spa_baseline(r.text, len(r.content), spa_text, spa_size):
+
+                # Step 1+2: Canary fingerprint match
+                if _matches_spa_baseline(r.text, len(r.content), spa_baseline, response_ct=ct):
                     if not _content_confirms_sensitive_file(path, r.text, content_type=ct):
                         spa_suppressed += 1
                         continue
-                # Archive paths not caught by SPA baseline: check Content-Type anyway
-                elif any(path.endswith(ext) for ext in BINARY_ARCHIVE_EXTENSIONS):
+
+                # Step 3: Content-Type sanity check — binary/config extensions never return text/html
+                elif any(path.endswith(ext) for ext in NONHTML_EXTENSIONS):
+                    ct_base = ct.lower().split(";")[0].strip()
+                    if ct_base == "text/html":
+                        spa_suppressed += 1
+                        continue
                     if not _content_confirms_sensitive_file(path, r.text, content_type=ct):
                         spa_suppressed += 1
                         continue
+
+                # Step 4: SPA body markers — suppress even without a canary match
+                elif any(marker in r.text for marker in SPA_BODY_MARKERS):
+                    spa_suppressed += 1
+                    continue
+
                 exposed.append((path, r.status_code, len(r.content)))
 
     if exposed:
@@ -550,7 +580,6 @@ def check_sensitive_files(session, base_url, spa_baseline=None):
 def check_admin_panels(session, base_url, spa_baseline=None):
     results = []
     found = []
-    spa_text, spa_size = spa_baseline or (None, None)
     spa_suppressed = 0
 
     for path in ADMIN_PATHS:
@@ -560,7 +589,8 @@ def check_admin_panels(session, base_url, spa_baseline=None):
             continue
         if r.status_code in (200, 401, 403):
             # For 200 responses, check if it's just the SPA catch-all
-            if r.status_code == 200 and _matches_spa_baseline(r.text, len(r.content), spa_text, spa_size):
+            ct = r.headers.get("Content-Type", "")
+            if r.status_code == 200 and _matches_spa_baseline(r.text, len(r.content), spa_baseline, response_ct=ct):
                 spa_suppressed += 1
                 continue
             found.append((path, r.status_code))
@@ -616,10 +646,45 @@ def _extract_api_hosts_from_js(all_js, base_host):
     return hosts
 
 
+def _extract_api_hosts_from_csp(csp_value, base_host):
+    """Extract distinct external API origins from a CSP connect-src directive.
+
+    The connect-src directive lists every origin the app is allowed to fetch from,
+    making it a reliable signal for backend API hosts even when they don't appear
+    in client-side JS (e.g. a Railway backend called only via env-injected config).
+    Wildcard origins (*.supabase.co) are skipped — we can't probe them without a
+    concrete subdomain.
+    """
+    if not csp_value:
+        return []
+    # Prefer connect-src; fall back to default-src
+    match = re.search(r'connect-src\s+([^;]+)', csp_value, re.I)
+    if not match:
+        match = re.search(r'default-src\s+([^;]+)', csp_value, re.I)
+    if not match:
+        return []
+    hosts = []
+    seen = set()
+    for token in match.group(1).split():
+        token = token.strip("'\"")
+        if not token.startswith("https://"):
+            continue
+        try:
+            parsed = urllib.parse.urlparse(token)
+            if not parsed.netloc or parsed.netloc.startswith("*"):
+                continue  # skip wildcard sources like *.supabase.co
+            origin = f"https://{parsed.netloc}"
+            if parsed.netloc != base_host and origin not in seen:
+                seen.add(origin)
+                hosts.append(origin)
+        except Exception:
+            pass
+    return hosts
+
+
 def check_api_endpoints(session, base_url, spa_baseline=None, all_js=None):
     results = []
     found = []
-    spa_text, spa_size = spa_baseline or (None, None)
     spa_suppressed = 0
 
     for path in API_PATHS:
@@ -629,10 +694,10 @@ def check_api_endpoints(session, base_url, spa_baseline=None, all_js=None):
             continue
         if r.status_code in (200, 401, 403):
             # For 200 responses, check if it's just the SPA catch-all
-            if r.status_code == 200 and _matches_spa_baseline(r.text, len(r.content), spa_text, spa_size):
+            content_type = r.headers.get("Content-Type", "")
+            if r.status_code == 200 and _matches_spa_baseline(r.text, len(r.content), spa_baseline, response_ct=content_type):
                 spa_suppressed += 1
                 continue
-            content_type = r.headers.get("Content-Type", "")
             found.append((path, r.status_code, content_type, r.text[:20000]))
 
     cors_checked = False
@@ -704,7 +769,7 @@ def check_api_endpoints(session, base_url, spa_baseline=None, all_js=None):
             "No common API paths returned accessible responses."))
 
     # Check for rate limiting headers on auth/API endpoints (not homepage).
-    # If the JS references external API hosts (e.g. a Railway backend), probe those too —
+    # If the JS or CSP references external API hosts (e.g. a Railway backend), probe those too —
     # the CDN origin rarely carries rate-limit headers set by the app server.
     rate_check_paths = ["/api/auth/login", "/auth/login", "/api/login", "/login", "/api/token"]
 
@@ -713,6 +778,19 @@ def check_api_endpoints(session, base_url, spa_baseline=None, all_js=None):
         all_js = _collect_js_text(session, base_url, size_limit=200_000)
     base_parsed = urllib.parse.urlparse(base_url)
     external_api_hosts = _extract_api_hosts_from_js(all_js, base_parsed.netloc)
+
+    # Also mine the CSP connect-src directive — catches backends that are configured
+    # via environment variables at build time and never appear in JS source directly
+    # (e.g. a Railway/Render/Fly.io backend referenced only in NEXT_PUBLIC_* at build time
+    # but emitted as a CSP header by the CDN, not in a fetch() call the scanner sees).
+    r_base = safe_get(session, base_url)
+    if r_base:
+        csp = r_base.headers.get("Content-Security-Policy", "")
+        seen_hosts = set(external_api_hosts)
+        for h in _extract_api_hosts_from_csp(csp, base_parsed.netloc):
+            if h not in seen_hosts:
+                external_api_hosts.append(h)
+                seen_hosts.add(h)
 
     # Build list of origins to probe: external API hosts first, then the scanned origin
     origins_to_probe = external_api_hosts + [base_url.rstrip("/")]
@@ -727,8 +805,8 @@ def check_api_endpoints(session, base_url, spa_baseline=None, all_js=None):
             if r and r.status_code != 404:
                 rate_headers = [h for h in r.headers if "rate" in h.lower() or "retry" in h.lower() or "x-ratelimit" in h.lower()]
                 rate_checked_url = candidate
-                if origin not in (base_url.rstrip("/"),):
-                    rate_checked_host_note = f" (API host detected in JS: {origin})"
+                if origin != base_url.rstrip("/"):
+                    rate_checked_host_note = f" (backend host from CSP/JS: {origin})"
                 break
         if rate_checked_url:
             break
@@ -743,9 +821,7 @@ def check_api_endpoints(session, base_url, spa_baseline=None, all_js=None):
     if rate_checked_url:
         if not rate_headers:
             results.append(finding("LOW", "No Rate Limiting Headers Detected",
-                f"No rate limiting headers found on {rate_checked_url}.{rate_checked_host_note} "
-                f"Note: if your API lives on a separate host, rate limiting may be enforced there "
-                f"without advertising headers — verify manually.",
+                f"No rate limiting headers found on {rate_checked_url}.{rate_checked_host_note}",
                 "Implement rate limiting on login endpoints and APIs (e.g., X-RateLimit-* headers)."))
         else:
             results.append(finding("PASS", "Rate Limiting Headers Present",
