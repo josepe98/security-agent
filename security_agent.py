@@ -476,8 +476,21 @@ def _matches_spa_baseline(response_text, response_size, spa_baseline_text, spa_b
     return False
 
 
-def _content_confirms_sensitive_file(path, response_text):
+BINARY_ARCHIVE_EXTENSIONS = (".zip", ".tar.gz", ".tar", ".gz", ".tgz", ".bz2")
+BINARY_ARCHIVE_CONTENT_TYPES = ("application/zip", "application/x-tar", "application/gzip",
+                                 "application/x-gzip", "application/x-bzip2",
+                                 "application/octet-stream", "application/x-compressed")
+
+
+def _content_confirms_sensitive_file(path, response_text, content_type=None):
     """Check if the response body actually looks like the sensitive file type."""
+    # Binary archives must have a binary Content-Type — an SPA shell returns text/html
+    if any(path.endswith(ext) for ext in BINARY_ARCHIVE_EXTENSIONS):
+        if content_type:
+            ct = content_type.lower().split(";")[0].strip()
+            return ct in BINARY_ARCHIVE_CONTENT_TYPES
+        # No Content-Type header — can't confirm, treat as false positive
+        return False
     signatures = SENSITIVE_FILE_SIGNATURES.get(path, [])
     if not signatures:
         return True  # No signatures defined — can't disprove, keep the finding
@@ -501,8 +514,14 @@ def check_sensitive_files(session, base_url, spa_baseline=None):
             content = r.text[:200].lower()
             if "not found" not in content and "404" not in content:
                 # SPA catch-all detection: skip if response matches the baseline
+                ct = r.headers.get("Content-Type", "")
                 if _matches_spa_baseline(r.text, len(r.content), spa_text, spa_size):
-                    if not _content_confirms_sensitive_file(path, r.text):
+                    if not _content_confirms_sensitive_file(path, r.text, content_type=ct):
+                        spa_suppressed += 1
+                        continue
+                # Archive paths not caught by SPA baseline: check Content-Type anyway
+                elif any(path.endswith(ext) for ext in BINARY_ARCHIVE_EXTENSIONS):
+                    if not _content_confirms_sensitive_file(path, r.text, content_type=ct):
                         spa_suppressed += 1
                         continue
                 exposed.append((path, r.status_code, len(r.content)))
@@ -569,7 +588,35 @@ def check_admin_panels(session, base_url, spa_baseline=None):
     return results
 
 
-def check_api_endpoints(session, base_url, spa_baseline=None):
+def _extract_api_hosts_from_js(all_js, base_host):
+    """Extract distinct external API hostnames referenced in client-side JS.
+
+    Looks for absolute https:// URLs in fetch/axios calls and NEXT_PUBLIC_*_URL
+    env vars that point to a different host than the scanned site.
+    """
+    patterns = [
+        r'fetch\s*\(\s*["`\']?(https://[^\s"\'`\)]+)',
+        r'axios\.[a-z]+\s*\(\s*["`\'](https://[^\s"\'`\)]+)',
+        r'(?:NEXT_PUBLIC_\w*(?:API|BACKEND|SERVER|URL)\w*)["\s]*[:=]["\s]*(https://[^\s"\'`]+)',
+        r'(?:baseURL|apiUrl|apiBase|API_URL|VITE_API_URL)\s*[:=]\s*["`\'](https://[^\s"\'`]+)',
+    ]
+    hosts = []
+    seen = set()
+    for pat in patterns:
+        for match in re.finditer(pat, all_js, re.I):
+            raw = match.group(1).rstrip("/\\\"'`")
+            try:
+                parsed = urllib.parse.urlparse(raw)
+                host = f"{parsed.scheme}://{parsed.netloc}"
+                if parsed.netloc and parsed.netloc != base_host and host not in seen:
+                    seen.add(host)
+                    hosts.append(host)
+            except Exception:
+                pass
+    return hosts
+
+
+def check_api_endpoints(session, base_url, spa_baseline=None, all_js=None):
     results = []
     found = []
     spa_text, spa_size = spa_baseline or (None, None)
@@ -656,27 +703,49 @@ def check_api_endpoints(session, base_url, spa_baseline=None):
         results.append(finding("PASS", "No Common API Endpoints Exposed",
             "No common API paths returned accessible responses."))
 
-    # Check for rate limiting headers on auth/API endpoints (not homepage)
+    # Check for rate limiting headers on auth/API endpoints (not homepage).
+    # If the JS references external API hosts (e.g. a Railway backend), probe those too —
+    # the CDN origin rarely carries rate-limit headers set by the app server.
     rate_check_paths = ["/api/auth/login", "/auth/login", "/api/login", "/login", "/api/token"]
+
+    # Collect JS if not provided so we can detect external API hosts
+    if all_js is None:
+        all_js = _collect_js_text(session, base_url, size_limit=200_000)
+    base_parsed = urllib.parse.urlparse(base_url)
+    external_api_hosts = _extract_api_hosts_from_js(all_js, base_parsed.netloc)
+
+    # Build list of origins to probe: external API hosts first, then the scanned origin
+    origins_to_probe = external_api_hosts + [base_url.rstrip("/")]
+
     rate_checked_url = None
     rate_headers = []
-    for path in rate_check_paths:
-        candidate = base_url.rstrip("/") + path
-        r = safe_get(session, candidate)
-        if r and r.status_code != 404:
-            rate_headers = [h for h in r.headers if "rate" in h.lower() or "retry" in h.lower() or "x-ratelimit" in h.lower()]
-            rate_checked_url = candidate
+    rate_checked_host_note = ""
+    for origin in origins_to_probe:
+        for path in rate_check_paths:
+            candidate = origin.rstrip("/") + path
+            r = safe_get(session, candidate)
+            if r and r.status_code != 404:
+                rate_headers = [h for h in r.headers if "rate" in h.lower() or "retry" in h.lower() or "x-ratelimit" in h.lower()]
+                rate_checked_url = candidate
+                if origin not in (base_url.rstrip("/"),):
+                    rate_checked_host_note = f" (API host detected in JS: {origin})"
+                break
+        if rate_checked_url:
             break
+
     if not rate_checked_url:
-        # Fall back to homepage if no auth endpoint found
+        # Fall back to homepage
         r = safe_get(session, base_url)
         if r:
             rate_headers = [h for h in r.headers if "rate" in h.lower() or "retry" in h.lower() or "x-ratelimit" in h.lower()]
             rate_checked_url = base_url
+
     if rate_checked_url:
         if not rate_headers:
             results.append(finding("LOW", "No Rate Limiting Headers Detected",
-                f"No rate limiting headers found on {rate_checked_url}.",
+                f"No rate limiting headers found on {rate_checked_url}.{rate_checked_host_note} "
+                f"Note: if your API lives on a separate host, rate limiting may be enforced there "
+                f"without advertising headers — verify manually.",
                 "Implement rate limiting on login endpoints and APIs (e.g., X-RateLimit-* headers)."))
         else:
             results.append(finding("PASS", "Rate Limiting Headers Present",
