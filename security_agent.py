@@ -5,7 +5,7 @@ Performs passive security checks on websites and generates an interactive HTML r
 Usage: python security_agent.py <url1> [url2] [url3] ...
 """
 
-__version__ = "1.5.0"
+__version__ = "1.7.0"
 
 import sys
 import ssl
@@ -799,13 +799,22 @@ def check_api_endpoints(session, base_url, spa_baseline=None, all_js=None):
     rate_headers = []
     rate_checked_host_note = ""
     for origin in origins_to_probe:
-        for path in rate_check_paths:
+        is_external = (origin != base_url.rstrip("/"))
+        # For external API hosts (e.g. Railway backend), also try root "/" as a fallback —
+        # the backend may not expose any of the standard auth paths, but its root or
+        # health-check endpoint still returns headers that reveal infrastructure-level
+        # rate limiting (e.g. a Railway/Render reverse proxy or WAF).
+        paths_to_try = rate_check_paths + ([""] if is_external else [])
+        for path in paths_to_try:
             candidate = origin.rstrip("/") + path
             r = safe_get(session, candidate)
-            if r and r.status_code != 404:
+            # For external hosts accept any response — even 404s carry headers that reveal
+            # whether rate limiting is configured at the infra/proxy level.
+            # For the scanned origin, skip 404s (all SPA catch-all paths resolve to 200).
+            if r and (is_external or r.status_code != 404):
                 rate_headers = [h for h in r.headers if "rate" in h.lower() or "retry" in h.lower() or "x-ratelimit" in h.lower()]
                 rate_checked_url = candidate
-                if origin != base_url.rstrip("/"):
+                if is_external:
                     rate_checked_host_note = f" (backend host from CSP/JS: {origin})"
                 break
         if rate_checked_url:
@@ -1293,6 +1302,118 @@ def check_js_secrets(session, base_url, stealth=False):
             f"Scanned {len(absolute_js)} JS file(s) and inline scripts — no credential patterns matched."))
 
     return results
+
+
+# ─────────────────────────────────────────────
+# TEMPLATE ENGINE FINGERPRINTING + STATIC SSTI
+# ─────────────────────────────────────────────
+
+def _detect_template_engines(session, base_url, all_js=""):
+    """Return a list of template engine names detected from headers, HTML, or JS source."""
+    detected = set()
+
+    # Check X-Powered-By and Server headers
+    r = safe_get(session, base_url)
+    if r:
+        for header in ("X-Powered-By", "Server", "X-Generator"):
+            val = r.headers.get(header, "").lower()
+            for name in ("ejs", "pug", "jade", "nunjucks", "handlebars", "mustache",
+                         "jinja", "twig", "blade", "velocity", "freemarker", "thymeleaf"):
+                if name in val:
+                    detected.add(name.capitalize())
+
+        # Check HTML source for meta generator or SSR hints
+        html = r.text.lower()
+        for name, hint in [("ejs", "EJS"), ("pug", "Pug"), ("nunjucks", "Nunjucks"),
+                            ("handlebars", "Handlebars"), ("mustache", "Mustache"),
+                            ("jinja", "Jinja2"), ("twig", "Twig"), ("thymeleaf", "Thymeleaf")]:
+            if f'"{name}"' in html or f"'{name}'" in html or f"/{name}/" in html:
+                detected.add(hint)
+
+    # Check JS source (bundle may contain require/import of template engines)
+    if all_js:
+        js_lower = all_js.lower()
+        for name, hint in [("ejs", "EJS"), ("pug", "Pug"), ("jade", "Pug/Jade"),
+                            ("nunjucks", "Nunjucks"), ("handlebars", "Handlebars"),
+                            ("mustache", "Mustache")]:
+            if f'"{name}"' in js_lower or f"'{name}'" in js_lower:
+                detected.add(hint)
+
+    return sorted(detected)
+
+
+def check_js_ssti_patterns(session, base_url, stealth=False):
+    """Scan downloaded JS for template engine fingerprints and unsafe render() call patterns.
+
+    This is a lightweight SAST-style pass over client-side JS. It won't catch
+    pure server-side template logic, but Next.js / Nuxt / universal apps often
+    bundle SSR rendering code that appears in the JS payload. Complements dynamic
+    SSTI probing (which requires injectable inputs) and external SAST tools like
+    Aikido that analyse the full source tree.
+    """
+    results = []
+
+    # Collect all JS (inline + external files)
+    all_js = _collect_js_text(session, base_url, stealth=stealth, size_limit=500_000)
+    if not all_js:
+        results.append(finding("INFO", "JS SSTI Scan: No JavaScript Found",
+            "No JavaScript source was retrievable for static analysis."))
+        return results, []
+
+    # Detect which template engines are present
+    engines_detected = _detect_template_engines(session, base_url, all_js=all_js)
+
+    fingerprints = []
+    unsafe_calls = []
+
+    for pattern, engine, kind in SSTI_SOURCE_PATTERNS:
+        matches = re.findall(pattern, all_js, re.I)
+        if not matches:
+            continue
+        if kind == "fingerprint":
+            fingerprints.append(engine)
+        elif kind == "unsafe_render":
+            unsafe_calls.append((engine, pattern, matches[0][:80]))
+
+    # Deduplicate
+    fingerprints = sorted(set(fingerprints))
+    seen_engines = set()
+    deduped_unsafe = []
+    for engine, pat, snippet in unsafe_calls:
+        if engine not in seen_engines:
+            seen_engines.add(engine)
+            deduped_unsafe.append((engine, snippet))
+
+    if unsafe_calls:
+        for engine, snippet in deduped_unsafe:
+            results.append(finding(
+                "MEDIUM",
+                f"Possible Unsafe Template Render — {engine}",
+                f"A {engine} render/compile call was found in client-side JS with a non-literal "
+                f"first argument, suggesting the template string may come from a variable. "
+                f"If that variable is user-controlled, this is an SSTI vulnerability. "
+                f"Dynamic scanning cannot confirm this — pair with a SAST tool (e.g. Aikido) "
+                f"for full source-level analysis.",
+                f"Ensure template strings are never derived from user input. "
+                f"Use fixed template names/files; never pass req.body or query params as the template.",
+                snippet.strip()))
+    elif fingerprints:
+        results.append(finding(
+            "INFO",
+            f"Template Engine(s) Detected in JS: {', '.join(fingerprints)}",
+            f"Template engine imports found in client-side JS. No unsafe render() patterns detected "
+            f"by static analysis, but dynamic testing (--active) and a dedicated SAST tool "
+            f"(e.g. Aikido) are recommended to rule out SSTI in server-side rendering paths.",
+            "Ensure all template rendering uses fixed template names, never user-supplied strings."))
+    else:
+        results.append(finding("PASS", "No Template Engine SSTI Patterns in JS",
+            "No template engine imports or unsafe render() call patterns found in client-side JS. "
+            "Note: server-side-only template logic is not visible to this scanner — "
+            "use a SAST tool (e.g. Aikido) for full coverage."))
+
+    # Combine engines from both header/HTML detection and static pattern matching
+    all_engines = sorted(set(engines_detected + fingerprints))
+    return results, all_engines
 
 
 # ─────────────────────────────────────────────
@@ -1885,8 +2006,42 @@ def _xss_token():
     uid = uuid.uuid4().hex[:8]
     return f"<xss-probe-{uid}>", f"xss-probe-{uid}"
 
-# Template / expression injection: look for evaluated output (7*7=49)
-TEMPLATE_PAYLOADS = ["{{7*7}}", "${7*7}", "#{7*7}", "<%= 7*7 %>"]
+# Template / expression injection payloads: (payload, expected_output, engine_hint)
+# Each payload evaluates 7*7=49 (or 7*'7'='7777777' for Jinja2 string-multiply).
+# The engine hint is included in findings so the report is actionable.
+TEMPLATE_PAYLOADS = [
+    ("{{7*7}}",    "49",       "Jinja2/Nunjucks/Twig"),
+    ("{{7*'7'}}",  "7777777",  "Jinja2"),          # string-multiply distinguishes Jinja2 from Twig
+    ("${7*7}",     "49",       "EL/Groovy/Velocity"),
+    ("#{7*7}",     "49",       "Thymeleaf/Ruby ERB"),
+    ("<%= 7*7 %>", "49",       "EJS/Ruby ERB"),
+    ("{7*7}",      "49",       "Smarty"),
+    ("[[${7*7}]]", "49",       "Thymeleaf"),
+]
+
+# Static JS patterns that indicate a template engine is in use or that user input
+# may be passed unsafely to a template renderer (SAST-style signal, not dynamic).
+SSTI_SOURCE_PATTERNS = [
+    # Template engine imports — fingerprinting only, always INFO
+    (r"require\s*\(\s*['\"]ejs['\"]",                                           "EJS",        "fingerprint"),
+    (r"require\s*\(\s*['\"]pug['\"]|require\s*\(\s*['\"]jade['\"]",            "Pug/Jade",   "fingerprint"),
+    (r"require\s*\(\s*['\"]handlebars['\"]|require\s*\(\s*['\"]hbs['\"]",      "Handlebars", "fingerprint"),
+    (r"require\s*\(\s*['\"]nunjucks['\"]",                                      "Nunjucks",   "fingerprint"),
+    (r"require\s*\(\s*['\"]mustache['\"]",                                      "Mustache",   "fingerprint"),
+    (r"from\s+['\"]ejs['\"]",                                                   "EJS",        "fingerprint"),
+    (r"from\s+['\"]pug['\"]|from\s+['\"]jade['\"]",                            "Pug/Jade",   "fingerprint"),
+    (r"from\s+['\"]handlebars['\"]|from\s+['\"]hbs['\"]",                      "Handlebars", "fingerprint"),
+    (r"from\s+['\"]nunjucks['\"]",                                              "Nunjucks",   "fingerprint"),
+    # Unsafe render calls — template string comes from a variable, not a literal
+    # Pattern: engineName.render( NOT followed by a quote character
+    (r"ejs\.render\s*\(\s*(?!['\"`])",                                          "EJS",        "unsafe_render"),
+    (r"pug\.render\s*\(\s*(?!['\"`])",                                          "Pug",        "unsafe_render"),
+    (r"nunjucks\.renderString\s*\(\s*(?!['\"`])",                               "Nunjucks",   "unsafe_render"),
+    (r"handlebars\.compile\s*\(\s*(?!['\"`])",                                  "Handlebars", "unsafe_render"),
+    (r"mustache\.render\s*\(\s*(?!['\"`])",                                     "Mustache",   "unsafe_render"),
+    # Express res.render() with a dynamic/request-derived first arg
+    (r"res\.render\s*\(\s*(?:req\.|[a-zA-Z_$][\w$]*\.(?:body|query|params))",  "Express",    "unsafe_render"),
+]
 
 
 def check_blind_sqli(session, base_url, stealth=False):
@@ -2127,7 +2282,7 @@ def check_injection(session, base_url):
             pass
 
         # ── Template / Expression Injection ──
-        for tpl_payload in TEMPLATE_PAYLOADS:
+        for tpl_payload, tpl_expected, tpl_engine in TEMPLATE_PAYLOADS:
             try:
                 if method == "GET":
                     parsed = urllib.parse.urlparse(action)
@@ -2141,11 +2296,11 @@ def check_injection(session, base_url):
                                      timeout=TIMEOUT, verify=False,
                                      headers={"User-Agent": USER_AGENT})
 
-                if r and r.status_code == 200 and "49" in r.text:
-                    # Sanity-check: baseline page shouldn't already contain "49"
+                if r and r.status_code == 200 and tpl_expected in r.text:
+                    # Sanity-check: baseline page shouldn't already contain the expected output
                     baseline = safe_get(session, base_url)
-                    if baseline and "49" not in baseline.text:
-                        tpl_vulnerable.append((param, tpl_payload))
+                    if baseline and tpl_expected not in baseline.text:
+                        tpl_vulnerable.append((param, tpl_payload, tpl_engine))
                         break
             except Exception:
                 pass
@@ -2174,15 +2329,19 @@ def check_injection(session, base_url):
             f"Tested {len(tested_params)} input(s) — injected tags were not reflected unescaped."))
 
     if tpl_vulnerable:
-        for param, payload in tpl_vulnerable:
+        for param, payload, engine in tpl_vulnerable:
             results.append(finding(
-                "CRITICAL", f"Possible Template Injection — Parameter: '{param}'",
-                f"Payload '{payload}' evaluated to 49, suggesting server-side template execution.",
-                "Never pass user input directly into template engines. Sanitise and sandbox all template rendering.",
-                f"param={param}, payload={payload}"))
+                "CRITICAL", f"Server-Side Template Injection (SSTI) — Parameter: '{param}'",
+                f"Payload '{payload}' ({engine}) was evaluated by the server, confirming SSTI. "
+                f"An attacker can escalate this to remote code execution.",
+                "Never pass user input to a template engine as the template string. "
+                "Use fixed template names/files only. Sandbox and restrict template engine capabilities.",
+                f"param={param}, payload={payload}, engine={engine}"))
     else:
         results.append(finding("PASS", "No Template Injection Detected",
-            f"Tested {len(tested_params)} input(s) — no expression evaluation detected."))
+            f"Tested {len(tested_params)} input(s) with {len(TEMPLATE_PAYLOADS)} engine-specific "
+            f"payloads — no expression evaluation detected. Use --playwright for rendered inputs "
+            f"and a SAST tool (e.g. Aikido) for server-side template logic."))
 
     return results
 
@@ -2558,7 +2717,7 @@ def _pw_test_injection(page, context, base_url, forms, standalone, stealth=False
             except Exception: pass
 
         # ── Template Injection ──
-        for tpl_payload in TEMPLATE_PAYLOADS:
+        for tpl_payload, tpl_expected, tpl_engine in TEMPLATE_PAYLOADS:
             try:
                 new_page = context.new_page()
                 new_page.goto(base_url, wait_until="domcontentloaded", timeout=20000)
@@ -2568,11 +2727,11 @@ def _pw_test_injection(page, context, base_url, forms, standalone, stealth=False
                     el.fill(tpl_payload)
                     el.press("Enter")
                     new_page.wait_for_timeout(1500)
-                    if "49" in new_page.content():
-                        # Baseline check
-                        baseline = new_page.goto(base_url, wait_until="domcontentloaded", timeout=10000)
-                        if "49" not in new_page.content():
-                            tpl_found.append((key, tpl_payload))
+                    if tpl_expected in new_page.content():
+                        # Baseline check — ensure the output wasn't already present
+                        new_page.goto(base_url, wait_until="domcontentloaded", timeout=10000)
+                        if tpl_expected not in new_page.content():
+                            tpl_found.append((key, tpl_payload, tpl_engine))
                 new_page.close()
                 if tpl_found:
                     break
@@ -2604,15 +2763,18 @@ def _pw_test_injection(page, context, base_url, forms, standalone, stealth=False
             f"Tested {len(tested)} rendered input(s) — no unescaped reflection found."))
 
     if tpl_found:
-        for field, payload in tpl_found:
+        for field, payload, engine in tpl_found:
             results.append(finding("CRITICAL",
-                f"Playwright: Template Injection — Field '{field}'",
-                f"Payload '{payload}' was evaluated server-side.",
-                "Never pass user input directly into template engines.",
-                f"field={field}, payload={payload}"))
+                f"Playwright: SSTI — Field '{field}' ({engine})",
+                f"Payload '{payload}' ({engine}) was evaluated server-side via a rendered input. "
+                f"This confirms SSTI and is likely exploitable for remote code execution.",
+                "Never pass user input to a template engine as the template string. "
+                "Use fixed template names/files only. Sandbox template engine capabilities.",
+                f"field={field}, payload={payload}, engine={engine}"))
     else:
         results.append(finding("PASS", "Playwright: No Template Injection Detected",
-            f"Tested {len(tested)} rendered input(s) — no expression evaluation detected."))
+            f"Tested {len(tested)} rendered input(s) with {len(TEMPLATE_PAYLOADS)} engine-specific "
+            f"payloads — no expression evaluation detected."))
 
     return results
 
@@ -2633,7 +2795,7 @@ def scan_url(url, active=False, stealth=False, use_playwright=False):
     session = get_session()
     results_by_category = {}
 
-    passive_total = 12 + (1 if use_playwright else 0)
+    passive_total = 13 + (1 if use_playwright else 0)
     total = passive_total + (4 if active else 0)
 
     # 1. SSL/TLS
@@ -2669,8 +2831,16 @@ def scan_url(url, active=False, stealth=False, use_playwright=False):
     print(f"    [ 6/{total}] JavaScript secret scanning...")
     results_by_category["JavaScript Secrets"] = check_js_secrets(session, url, stealth=stealth)
 
-    # 7. Database key probing (Supabase anon key, Firebase)
-    print(f"    [ 7/{total}] Database key probing...")
+    # 7. Static JS SSTI analysis (template engine fingerprinting + unsafe render() patterns)
+    print(f"    [ 7/{total}] JS template engine / SSTI static analysis...")
+    ssti_results, ssti_engines = check_js_ssti_patterns(session, url, stealth=stealth)
+    results_by_category["JS Template / SSTI"] = ssti_results
+    # Merge detected engines into tech fingerprint for downstream checks
+    if ssti_engines:
+        detected_tech = list(set(list(detected_tech) + ssti_engines))
+
+    # 8. Database key probing (Supabase anon key, Firebase)
+    print(f"    [ 8/{total}] Database key probing...")
     results_by_category["Database Keys"] = check_db_keys(session, url, stealth=stealth, detected_tech=detected_tech)
 
     # SPA catch-all detection (avoids false positives on path probes)
@@ -2678,40 +2848,40 @@ def scan_url(url, active=False, stealth=False, use_playwright=False):
     if spa_baseline[0] is not None:
         print(f"    [info] SPA catch-all detected — will validate path probe results")
 
-    # 8. Sensitive files
-    print(f"    [ 8/{total}] Sensitive file exposure...")
+    # 9. Sensitive files
+    print(f"    [ 9/{total}] Sensitive file exposure...")
     results_by_category["Sensitive Files"] = check_sensitive_files(session, url, spa_baseline=spa_baseline)
 
-    # 9. Admin panels
-    print(f"    [ 9/{total}] Admin panel discovery...")
+    # 10. Admin panels
+    print(f"    [10/{total}] Admin panel discovery...")
     results_by_category["Admin Panels"] = check_admin_panels(session, url, spa_baseline=spa_baseline)
 
-    # 10. API security
-    print(f"    [10/{total}] API endpoint checks...")
+    # 11. API security
+    print(f"    [11/{total}] API endpoint checks...")
     results_by_category["API Security"] = check_api_endpoints(session, url, spa_baseline=spa_baseline)
 
-    # 11. Authentication
-    print(f"    [11/{total}] Authentication checks...")
+    # 12. Authentication
+    print(f"    [12/{total}] Authentication checks...")
     results_by_category["Authentication"] = check_authentication(session, url)
 
-    # 12. Mixed content
-    print(f"    [12/{total}] Mixed content...")
+    # 13. Mixed content
+    print(f"    [13/{total}] Mixed content...")
     mc = check_mixed_content(session, url)
     if mc:
         results_by_category["Mixed Content"] = mc
 
     # ── Active checks (opt-in) ──
     if active:
-        print(f"    [13/{total}] Injection checks (SQL error-based, XSS, template)...")
+        print(f"    [14/{total}] Injection checks (SQL error-based, XSS, template)...")
         results_by_category["Injection Testing"] = check_injection(session, url)
 
-        print(f"    [14/{total}] Blind time-based SQL injection...")
+        print(f"    [15/{total}] Blind time-based SQL injection...")
         results_by_category["Blind SQL Injection"] = check_blind_sqli(session, url, stealth=stealth)
 
-        print(f"    [15/{total}] Open redirect testing...")
+        print(f"    [16/{total}] Open redirect testing...")
         results_by_category["Open Redirect"] = check_open_redirect(session, url, stealth=stealth)
 
-        print(f"    [16/{total}] Brute force / account lockout testing...")
+        print(f"    [17/{total}] Brute force / account lockout testing...")
         results_by_category["Brute Force Protection"] = check_brute_force(session, url, stealth=stealth)
 
     # ── Playwright headless browser scan (opt-in) ──
