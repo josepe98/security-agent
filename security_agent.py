@@ -5,7 +5,7 @@ Performs passive security checks on websites and generates an interactive HTML r
 Usage: python security_agent.py <url1> [url2] [url3] ...
 """
 
-__version__ = "1.8.0"
+__version__ = "1.9.0"
 
 import sys
 import ssl
@@ -19,6 +19,7 @@ import random
 import hashlib
 import urllib.parse
 import argparse
+import webbrowser
 from pathlib import Path
 
 try:
@@ -264,7 +265,7 @@ SECURITY_HEADERS = {
     },
 }
 
-SEVERITY_ORDER = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3, "INFO": 4, "PASS": 5}
+SEVERITY_ORDER = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3, "WARN": 4, "INFO": 5, "PASS": 6}
 
 
 # ─────────────────────────────────────────────
@@ -375,11 +376,11 @@ def check_ssl_tls(hostname, port=443):
     except ssl.SSLError as e:
         results.append(finding("HIGH", "SSL/TLS Error", str(e)))
     except ConnectionRefusedError:
-        results.append(finding("INFO", "HTTPS Not Available on Port 443",
+        results.append(finding("WARN", "HTTPS Not Available on Port 443",
             "Port 443 is closed or not responding.",
             "Ensure HTTPS is enabled and port 443 is open."))
     except Exception as e:
-        results.append(finding("INFO", "SSL Check Error", str(e)))
+        results.append(finding("WARN", "SSL Check Error", str(e)))
 
     return results
 
@@ -445,7 +446,7 @@ def check_https_redirect(session, url):
             results.append(finding("INFO", f"HTTP Status {r.status_code}",
                 f"HTTP request returned status {r.status_code}."))
     except Exception as e:
-        results.append(finding("INFO", "HTTP Redirect Check Failed", str(e)))
+        results.append(finding("WARN", "HTTP Redirect Check Failed", str(e)))
 
     return results
 
@@ -1261,7 +1262,7 @@ def check_js_secrets(session, base_url, stealth=False):
     results = []
     r = safe_get(session, base_url, stealth=stealth)
     if not r:
-        results.append(finding("INFO", "JS Secret Scan: Page Unreachable",
+        results.append(finding("WARN", "JS Secret Scan: Page Unreachable",
             "Could not load the page to locate JavaScript files."))
         return results
 
@@ -1382,7 +1383,7 @@ def check_js_ssti_patterns(session, base_url, stealth=False):
     # Collect all JS (inline + external files)
     all_js = _collect_js_text(session, base_url, stealth=stealth, size_limit=500_000)
     if not all_js:
-        results.append(finding("INFO", "JS SSTI Scan: No JavaScript Found",
+        results.append(finding("WARN", "JS SSTI Scan: No JavaScript Found",
             "No JavaScript source was retrievable for static analysis."))
         return results, []
 
@@ -1513,7 +1514,7 @@ def check_db_keys(session, base_url, stealth=False, detected_tech=None):
     results = []
     all_js = _collect_js_text(session, base_url, stealth=stealth)
     if not all_js:
-        results.append(finding("INFO", "DB Key Probe: Page Unreachable",
+        results.append(finding("WARN", "DB Key Probe: Page Unreachable",
             "Could not load page JS to scan for database keys."))
         return results
 
@@ -1820,7 +1821,7 @@ def check_db_keys(session, base_url, stealth=False, detected_tech=None):
         return results
 
     if not probed:
-        results.append(finding("INFO", "Database Keys Found but Probes Inconclusive",
+        results.append(finding("WARN", "Database Keys Found but Probes Inconclusive",
             "Database configuration was detected in JS but live probes failed or timed out."))
         return results
 
@@ -1839,7 +1840,7 @@ def check_dns_recon(hostname):
     results = []
 
     if not HAS_DNSPYTHON:
-        results.append(finding("INFO", "DNS Recon Skipped",
+        results.append(finding("WARN", "DNS Recon Skipped",
             "Install dnspython for DNS recon: pip install dnspython"))
         return results
 
@@ -1869,7 +1870,7 @@ def check_dns_recon(hostname):
                     "Soft fail still allows spoofed emails to be delivered.",
                     "Consider upgrading to -all for stricter enforcement.", spf))
     except Exception:
-        results.append(finding("INFO", "SPF Record Lookup Failed",
+        results.append(finding("WARN", "SPF Record Lookup Failed",
             "Could not retrieve TXT records for SPF check."))
 
     # ── DMARC ──
@@ -1958,7 +1959,7 @@ def check_http_methods(session, url, stealth=False):
         allow = r.headers.get("Allow", r.headers.get("Access-Control-Allow-Methods", ""))
 
         if not allow:
-            results.append(finding("INFO", "No Allow Header in OPTIONS Response",
+            results.append(finding("WARN", "No Allow Header in OPTIONS Response",
                 "Server did not return an Allow header — method enumeration inconclusive."))
             return results
 
@@ -1981,7 +1982,7 @@ def check_http_methods(session, url, stealth=False):
                 "TRACE, PUT, DELETE not advertised by OPTIONS response."))
 
     except Exception as e:
-        results.append(finding("INFO", "HTTP Method Enumeration Failed", str(e)))
+        results.append(finding("WARN", "HTTP Method Enumeration Failed", str(e)))
 
     return results
 
@@ -2134,7 +2135,7 @@ def check_open_redirect(session, base_url, stealth=False):
 
     r = safe_get(session, base_url, stealth=stealth)
     if not r:
-        results.append(finding("INFO", "Open Redirect: Page Unreachable",
+        results.append(finding("WARN", "Open Redirect: Page Unreachable",
             "Could not load the page to test redirect parameters."))
         return results
 
@@ -2507,7 +2508,7 @@ def check_playwright(url, active=False, stealth=False):
     results = []
 
     if not HAS_PLAYWRIGHT:
-        results.append(finding("INFO", "Playwright Not Installed",
+        results.append(finding("WARN", "Playwright Not Installed",
             "Headless browser scanning requires Playwright.",
             "Run: pip install playwright && playwright install chromium"))
         return results
@@ -2526,7 +2527,7 @@ def check_playwright(url, active=False, stealth=False):
                 page.goto(url, wait_until="domcontentloaded", timeout=15000)
                 page.wait_for_timeout(3000)  # give JS a moment to run
             except Exception:
-                results.append(finding("INFO", "Playwright: Page Load Timed Out",
+                results.append(finding("WARN", "Playwright: Page Load Timed Out",
                     f"Could not fully load {url} in 30s.", "Check if the URL is accessible."))
                 return results
 
@@ -2537,7 +2538,7 @@ def check_playwright(url, active=False, stealth=False):
         try:
             state = page.evaluate(_JS_EXTRACT_PAGE)
         except Exception as e:
-            results.append(finding("INFO", "Playwright: Page Extraction Failed", str(e)))
+            results.append(finding("WARN", "Playwright: Page Extraction Failed", str(e)))
             return results
 
         forms = state.get("forms", [])
@@ -2643,7 +2644,7 @@ def check_playwright(url, active=False, stealth=False):
             results.extend(injection_results)
 
     except Exception as e:
-        results.append(finding("INFO", "Playwright Scan Error", str(e)))
+        results.append(finding("WARN", "Playwright Scan Error", str(e)))
     finally:
         try:
             if page: page.close()
@@ -2841,7 +2842,7 @@ def scan_url(url, active=False, stealth=False, use_playwright=False):
         results_by_category["Technology Fingerprint"] = fp_results
         results_by_category["Version Disclosure"] = check_version_disclosure(r)
     else:
-        results_by_category["Security Headers"] = [finding("INFO", "Could Not Connect",
+        results_by_category["Security Headers"] = [finding("WARN", "Could Not Connect",
             "Unable to retrieve the page for header analysis.")]
         detected_tech = set()
 
@@ -2965,6 +2966,7 @@ SEVERITY_COLORS = {
     "HIGH": "#ea580c",
     "MEDIUM": "#d97706",
     "LOW": "#2563eb",
+    "WARN": "#ca8a04",
     "INFO": "#6b7280",
     "PASS": "#16a34a",
 }
@@ -2974,6 +2976,7 @@ SEVERITY_BADGE_COLORS = {
     "HIGH": "background:#ffedd5;color:#9a3412;border:1px solid #fdba74",
     "MEDIUM": "background:#fef3c7;color:#92400e;border:1px solid #fcd34d",
     "LOW": "background:#dbeafe;color:#1e40af;border:1px solid #93c5fd",
+    "WARN": "background:#fefce8;color:#854d0e;border:1px solid #fde047",
     "INFO": "background:#f3f4f6;color:#374151;border:1px solid #d1d5db",
     "PASS": "background:#dcfce7;color:#166534;border:1px solid #86efac",
 }
@@ -3088,6 +3091,7 @@ def generate_html_report(scan_results, output_path):
     <button class="filter-btn" onclick="filterFindings('HIGH')" style="border-color:#ea580c">High</button>
     <button class="filter-btn" onclick="filterFindings('MEDIUM')" style="border-color:#d97706">Medium</button>
     <button class="filter-btn" onclick="filterFindings('LOW')" style="border-color:#2563eb">Low</button>
+    <button class="filter-btn" onclick="filterFindings('WARN')" style="border-color:#ca8a04">Incomplete</button>
     <button class="filter-btn" onclick="filterFindings('PASS')" style="border-color:#16a34a">Passed</button>
   </div>
   <div id="siteSections"></div>
@@ -3297,7 +3301,7 @@ def main():
 
     print("  Generating HTML report...")
     generate_html_report(scan_results, output_path)
-    print(f"\n  Open: {output_path}")
+    webbrowser.open(output_path.as_uri())
     return str(output_path)
 
 
