@@ -5,7 +5,7 @@ Performs passive security checks on websites and generates an interactive HTML r
 Usage: python security_agent.py <url1> [url2] [url3] ...
 """
 
-__version__ = "1.7.0"
+__version__ = "1.8.0"
 
 import sys
 import ssl
@@ -452,26 +452,28 @@ def check_https_redirect(session, url):
 
 def detect_spa_baseline(session, base_url):
     """Fetch a random nonsense path to detect SPA catch-all routing.
-    Returns (body_text, content_length, body_hash, content_type) if the site returns 200
-    for unknown paths, or (None, None, None, None) if it properly returns 404."""
+    Returns (body_text, content_length, body_hash, content_type, canary_status) where
+    canary_status is the HTTP status code the canary path returned (or None on failure).
+    body_text is non-None only when the site returns 200 for unknown paths (SPA catch-all)."""
     canary_url = base_url.rstrip("/") + f"/{uuid.uuid4()}"
     r = safe_get(session, canary_url)
+    canary_status = r.status_code if r is not None else None
     if r is not None and r.status_code == 200 and len(r.content) > 0:
         body_hash = hashlib.sha1(r.content).hexdigest()
         content_type = r.headers.get("Content-Type", "")
-        return r.text, len(r.content), body_hash, content_type
-    return None, None, None, None
+        return r.text, len(r.content), body_hash, content_type, canary_status
+    return None, None, None, None, canary_status
 
 
 def _matches_spa_baseline(response_text, response_size, spa_baseline, response_ct=None):
     """Check if a response looks like the SPA catch-all page.
 
-    spa_baseline: 4-tuple (body_text, content_length, body_hash, content_type) as returned
-    by detect_spa_baseline(), or None if no catch-all was detected.
+    spa_baseline: 5-tuple (body_text, content_length, body_hash, content_type, canary_status)
+    as returned by detect_spa_baseline(), or None if no catch-all was detected.
     """
     if spa_baseline is None or spa_baseline[0] is None:
         return False
-    spa_text, spa_size, spa_hash, spa_ct = spa_baseline
+    spa_text, spa_size, spa_hash, spa_ct = spa_baseline[:4]
     # Hash match — identical response body, strongest possible signal
     if spa_hash:
         response_hash = hashlib.sha1(response_text.encode("utf-8", errors="replace")).hexdigest()
@@ -556,14 +558,30 @@ def check_sensitive_files(session, base_url, spa_baseline=None):
 
                 exposed.append((path, r.status_code, len(r.content)))
 
+    # Files that are public by design — flagging them as "sensitive" is a false positive.
+    PUBLIC_BY_DESIGN = {"/robots.txt", "/sitemap.xml", "/crossdomain.xml",
+                        "/clientaccesspolicy.xml", "/.well-known/security.txt"}
+
     if exposed:
         for path, status, size in exposed:
-            sev = "CRITICAL" if path in ("/.env", "/.git/HEAD", "/.git/config",
-                                          "/wp-config.php", "/config.php") else "MEDIUM"
-            results.append(finding(sev, f"Sensitive File Exposed: {path}",
-                f"File accessible at {path} (HTTP {status}, {size} bytes).",
-                f"Restrict access to {path} via server configuration.",
-                f"URL: {base_url.rstrip('/')}{path}"))
+            if path in ("/.env", "/.git/HEAD", "/.git/config",
+                        "/wp-config.php", "/config.php"):
+                sev = "CRITICAL"
+            elif path in PUBLIC_BY_DESIGN:
+                sev = "INFO"
+            else:
+                sev = "MEDIUM"
+            if sev == "INFO":
+                results.append(finding(sev, f"Public File Present: {path}",
+                    f"{path} is accessible (HTTP {status}, {size} bytes). "
+                    f"This file is public by design but may reveal URL structure or site metadata.",
+                    "",
+                    f"URL: {base_url.rstrip('/')}{path}"))
+            else:
+                results.append(finding(sev, f"Sensitive File Exposed: {path}",
+                    f"File accessible at {path} (HTTP {status}, {size} bytes).",
+                    f"Restrict access to {path} via server configuration.",
+                    f"URL: {base_url.rstrip('/')}{path}"))
     else:
         results.append(finding("PASS", "Sensitive Files Not Exposed",
             "No common sensitive files found publicly accessible."))
@@ -582,6 +600,10 @@ def check_admin_panels(session, base_url, spa_baseline=None):
     found = []
     spa_suppressed = 0
 
+    # If the canary itself returned 403, the site uses 403 as its catch-all for unknown
+    # paths (common on Vercel SPAs with certain routing configs) — suppress all 403s.
+    canary_status = spa_baseline[4] if (spa_baseline and len(spa_baseline) > 4) else None
+
     for path in ADMIN_PATHS:
         url = base_url.rstrip("/") + path
         r = safe_get(session, url)
@@ -591,6 +613,10 @@ def check_admin_panels(session, base_url, spa_baseline=None):
             # For 200 responses, check if it's just the SPA catch-all
             ct = r.headers.get("Content-Type", "")
             if r.status_code == 200 and _matches_spa_baseline(r.text, len(r.content), spa_baseline, response_ct=ct):
+                spa_suppressed += 1
+                continue
+            # If canary returned 403, this platform uses 403 as its unknown-path response
+            if r.status_code == 403 and canary_status == 403:
                 spa_suppressed += 1
                 continue
             found.append((path, r.status_code))
