@@ -5,7 +5,7 @@ Performs passive security checks on websites and generates an interactive HTML r
 Usage: python security_agent.py <url1> [url2] [url3] ...
 """
 
-__version__ = "1.10.0"
+__version__ = "1.11.0"
 
 import sys
 import ssl
@@ -408,6 +408,9 @@ def check_security_headers(response):
             else:
                 results.append(finding("PASS", f"{header_name} Present",
                     meta["description"], evidence=val))
+        elif header_name == "X-XSS-Protection" and "content-security-policy" in headers:
+            results.append(finding("PASS", "X-XSS-Protection Not Needed",
+                "X-XSS-Protection is deprecated and redundant when CSP is present."))
         else:
             results.append(finding(meta["severity"], f"Missing {header_name}",
                 meta["description"], meta["recommendation"]))
