@@ -5,7 +5,7 @@ Performs passive security checks on websites and generates an interactive HTML r
 Usage: python security_agent.py <url1> [url2] [url3] ...
 """
 
-__version__ = "1.9.0"
+__version__ = "1.10.0"
 
 import sys
 import ssl
@@ -2927,7 +2927,7 @@ def scan_url(url, active=False, stealth=False, use_playwright=False):
 
 def compute_score(categories):
     penalty = 0
-    counts = {"CRITICAL": 0, "HIGH": 0, "MEDIUM": 0, "LOW": 0}
+    counts = {"CRITICAL": 0, "HIGH": 0, "MEDIUM": 0, "LOW": 0, "WARN": 0}
     for findings in categories.values():
         for f in findings:
             sev = f["severity"]
@@ -2943,6 +2943,8 @@ def compute_score(categories):
             elif sev == "LOW":
                 penalty += 3
                 counts["LOW"] += 1
+            elif sev == "WARN":
+                counts["WARN"] += 1
     score = max(0, 100 - penalty)
     if score >= 80:
         grade = "A"
@@ -3091,7 +3093,7 @@ def generate_html_report(scan_results, output_path):
     <button class="filter-btn" onclick="filterFindings('HIGH')" style="border-color:#ea580c">High</button>
     <button class="filter-btn" onclick="filterFindings('MEDIUM')" style="border-color:#d97706">Medium</button>
     <button class="filter-btn" onclick="filterFindings('LOW')" style="border-color:#2563eb">Low</button>
-    <button class="filter-btn" onclick="filterFindings('WARN')" style="border-color:#ca8a04">Incomplete</button>
+    <button class="filter-btn" onclick="filterFindings('WARN')" style="border-color:#ca8a04">Warn</button>
     <button class="filter-btn" onclick="filterFindings('PASS')" style="border-color:#16a34a">Passed</button>
   </div>
   <div id="siteSections"></div>
@@ -3124,6 +3126,7 @@ function renderSummary() {{
         ${{site.counts.HIGH ? `<span class="badge" style="background:#ffedd5;color:#9a3412">${{site.counts.HIGH}} High</span>` : ''}}
         ${{site.counts.MEDIUM ? `<span class="badge" style="background:#fef3c7;color:#92400e">${{site.counts.MEDIUM}} Medium</span>` : ''}}
         ${{site.counts.LOW ? `<span class="badge" style="background:#dbeafe;color:#1e40af">${{site.counts.LOW}} Low</span>` : ''}}
+        ${{site.counts.WARN ? `<span class="badge" style="background:#fefce8;color:#854d0e">${{site.counts.WARN}} Warn</span>` : ''}}
       </div>`;
     grid.appendChild(card);
   }});
