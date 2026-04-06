@@ -2,7 +2,7 @@
 
 A Python-based web security scanner that performs passive and optional active checks against web applications, then generates a self-contained interactive HTML report. Built for developers and security practitioners who need a quick, actionable picture of a site's security posture without standing up a full enterprise scanning platform.
 
-**Current version: 1.7.0**
+**Current version: 1.11.0**
 
 ---
 
