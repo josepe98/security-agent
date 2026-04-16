@@ -2,7 +2,7 @@
 
 A Python-based web security scanner that performs passive and optional active checks against web applications, then generates a self-contained interactive HTML report. Built for developers and security practitioners who need a quick, actionable picture of a site's security posture without standing up a full enterprise scanning platform.
 
-**Current version: 1.11.0**
+**Current version: 1.12.0**
 
 ---
 
@@ -104,7 +104,7 @@ The scanner writes a self-contained HTML report to the current directory:
 security_report_example.com_2026-03-28_120000.html
 ```
 
-The report is filterable by severity (CRITICAL, HIGH, MEDIUM, LOW, INFO, PASS) and includes remediation guidance for every finding. No external dependencies — open it in any browser.
+The report is filterable by severity (CRITICAL, HIGH, MEDIUM, LOW, WARN, INFO, PASS) and includes remediation guidance for every finding. No external dependencies — open it in any browser.
 
 ---
 
@@ -116,6 +116,7 @@ The report is filterable by severity (CRITICAL, HIGH, MEDIUM, LOW, INFO, PASS) a
 | HIGH | Strong indicator of a serious vulnerability |
 | MEDIUM | Potential vulnerability or missing defence-in-depth control |
 | LOW | Minor issue or informational finding worth addressing |
+| WARN | Check could not complete (network error, missing dependency, etc.) |
 | INFO | Contextual data (tech fingerprint, detected engine, recon results) |
 | PASS | Check completed with no issues found |
 
