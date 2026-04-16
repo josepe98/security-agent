@@ -124,6 +124,48 @@ MANAGED_PLATFORMS = [
     (r"ghost\.io|content\.ghost\.org",        "Ghost (Managed)"),
 ]
 
+# Platforms that use wildcard DNS — all subdomains resolve regardless of whether
+# they're real deployments.  Subdomain enumeration and SPF/DMARC checks are
+# meaningless when the scanned hostname is a subdomain of one of these.
+WILDCARD_DNS_PLATFORMS = {
+    "vercel.app":       "Vercel",
+    "netlify.app":      "Netlify",
+    "herokuapp.com":    "Heroku",
+    "fly.dev":          "Fly.io",
+    "pages.dev":        "Cloudflare Pages",
+    "web.app":          "Firebase Hosting",
+    "firebaseapp.com":  "Firebase Hosting",
+    "onrender.com":     "Render",
+    "up.railway.app":   "Railway",
+    "surge.sh":         "Surge",
+    "github.io":        "GitHub Pages",
+    "gitlab.io":        "GitLab Pages",
+    "azurewebsites.net":"Azure App Service",
+    "azurestaticapps.net":"Azure Static Web Apps",
+}
+
+# Third-party SaaS API domains — probing these for rate-limit headers is not
+# actionable because the site owner doesn't control them.
+THIRD_PARTY_API_DOMAINS = {
+    "mapbox.com", "api.mapbox.com", "events.mapbox.com",
+    "stripe.com", "api.stripe.com", "js.stripe.com",
+    "twilio.com", "api.twilio.com",
+    "sentry.io",
+    "google-analytics.com", "www.google-analytics.com",
+    "googleapis.com", "fonts.googleapis.com", "maps.googleapis.com",
+    "googletagmanager.com", "www.googletagmanager.com",
+    "cloudinary.com", "api.cloudinary.com", "res.cloudinary.com",
+    "algolia.net", "algolianet.com",
+    "segment.io", "api.segment.io", "cdn.segment.com",
+    "mixpanel.com", "api.mixpanel.com",
+    "intercom.io", "api.intercom.io",
+    "pusher.com", "api.pusher.com",
+    "plausible.io",
+    "hcaptcha.com", "api.hcaptcha.com",
+    "recaptcha.net",
+    "unpkg.com", "cdn.jsdelivr.net", "cdnjs.cloudflare.com",
+}
+
 SELF_HOSTED_FRAMEWORKS = [
     (r"/wp-content/|wp-json|xmlrpc\.php",         "WordPress"),
     (r"Drupal\.settings|drupal\.js|/sites/default/files", "Drupal"),
@@ -278,7 +320,7 @@ def get_session():
         "User-Agent": random.choice(ROTATING_USER_AGENTS),
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
         "Accept-Language": "en-GB,en;q=0.9",
-        "Accept-Encoding": "gzip, deflate, br",
+        "Accept-Encoding": "gzip, deflate",
         "Connection": "keep-alive",
     })
     return s
@@ -518,7 +560,10 @@ def _content_confirms_sensitive_file(path, response_text, content_type=None):
         return False
     signatures = SENSITIVE_FILE_SIGNATURES.get(path, [])
     if not signatures:
-        return True  # No signatures defined — can't disprove, keep the finding
+        # No signatures defined — but if the body contains SPA markers, it's a catch-all
+        if any(marker in response_text for marker in SPA_BODY_MARKERS):
+            return False
+        return True  # Can't disprove, keep the finding
     sample = response_text[:4000]
     return any(re.search(sig, sample) for sig in signatures)
 
@@ -821,6 +866,12 @@ def check_api_endpoints(session, base_url, spa_baseline=None, all_js=None):
             if h not in seen_hosts:
                 external_api_hosts.append(h)
                 seen_hosts.add(h)
+
+    # Filter out third-party SaaS APIs — missing rate-limit headers on these aren't actionable
+    def _is_third_party(origin):
+        host = urllib.parse.urlparse(origin).hostname or ""
+        return any(host == d or host.endswith("." + d) for d in THIRD_PARTY_API_DOMAINS)
+    external_api_hosts = [h for h in external_api_hosts if not _is_third_party(h)]
 
     # Build list of origins to probe: external API hosts first, then the scanned origin
     origins_to_probe = external_api_hosts + [base_url.rstrip("/")]
@@ -1499,9 +1550,9 @@ def _collect_js_text(session, base_url, stealth=False, size_limit=500_000):
         jr = safe_get(session, abs_url, stealth=stealth)
         if not jr or jr.status_code != 200:
             continue
-        # For large files, still search — but only keep if they contain a Supabase/Firebase signal
+        # For large files, still search — but only keep if they contain a DB signal or a JWT (anon key)
         if len(jr.content) > size_limit:
-            if re.search(r'supabase\.co|firebaseio\.com|firebaseapp\.com', jr.text):
+            if re.search(r'supabase\.co|firebaseio\.com|firebaseapp\.com|eyJ[A-Za-z0-9_\-]{20,}\.eyJ', jr.text):
                 parts.append(jr.text)
         else:
             parts.append(jr.text)
@@ -1545,6 +1596,25 @@ def check_db_keys(session, base_url, stealth=False, detected_tech=None):
             if jwt_m:
                 supabase_pairs = [(m.group(0), jwt_m.group(0))]
                 break
+    # Pass 4: broad fallback — if Supabase URL found but key wasn't nearby, search all JS
+    # for any JWT (the anon key may be in a different chunk or far away in minified code)
+    if not supabase_pairs:
+        url_m = re.search(r'https://[a-z0-9]+\.supabase\.co', all_js, re.I)
+        if url_m:
+            jwt_m = re.search(
+                r'eyJ[A-Za-z0-9_\-]{20,}\.[A-Za-z0-9_\-]{20,}\.[A-Za-z0-9_\-]{10,}',
+                all_js)
+            if jwt_m:
+                supabase_pairs = [(url_m.group(0), jwt_m.group(0))]
+
+    # Extract table names from .from('table') calls in JS (Supabase client pattern)
+    js_tables = set(re.findall(r'\.from\s*\(\s*["\']([a-zA-Z_][a-zA-Z0-9_]*)["\']', all_js))
+
+    COMMON_SUPABASE_TABLES = {
+        "profiles", "users", "posts", "orders", "products", "settings",
+        "organizations", "transactions", "invoices", "payments", "items",
+        "accounts", "customers", "emails", "members",
+    }
 
     for supabase_url, anon_key in supabase_pairs[:2]:
         try:
@@ -1555,53 +1625,75 @@ def check_db_keys(session, base_url, stealth=False, detected_tech=None):
                 headers=headers, timeout=TIMEOUT, verify=False)
 
             if root_resp.status_code == 401:
-                probed.append(("PASS", "Supabase Anon Key Rejected",
-                    "Anon key found in client JS was rejected (401) by the database API.",
-                    None, f"Project: {supabase_url}"))
-                continue
-
-            if root_resp.status_code != 200:
-                continue
-
-            try:
-                spec = root_resp.json()
-            except Exception:
-                continue
-
-            table_paths = [p.lstrip("/") for p in spec.get("paths", {}) if p not in ("/", "")]
-            if not table_paths:
-                probed.append(("PASS", "Supabase Anon Key: No Tables Exposed",
-                    "Anon key accepted but no readable tables found in API spec.",
-                    None, f"Project: {supabase_url}"))
-                continue
-
-            # Try to read one row from the first listed table
-            table = table_paths[0]
-            row_resp = session.get(
-                f"{supabase_url.rstrip('/')}/rest/v1/{table}?select=*&limit=1",
-                headers=headers, timeout=TIMEOUT, verify=False)
-
-            if row_resp.status_code == 200:
+                # Root rejected, but individual tables may still be readable via RLS.
+                # Fall through to table probing with JS-extracted / common table names.
+                spec_tables = set()
+            elif root_resp.status_code == 200:
                 try:
-                    data = row_resp.json()
+                    spec = root_resp.json()
                 except Exception:
-                    data = None
-                if isinstance(data, list):
-                    probed.append(("CRITICAL", "Supabase Anon Key Grants Database Read Access",
-                        f"Anon key from client JS successfully read table '{table}' ({len(data)} row(s) returned). "
-                        "Row Level Security (RLS) is disabled or overly permissive.",
-                        "Enable RLS on all Supabase tables. Anon keys are intentionally public — "
-                        "RLS is the only thing preventing public data access.",
-                        f"Table: {table} | Rows returned: {len(data)} | Key: {anon_key[:24]}..."))
-                else:
-                    probed.append(("HIGH", "Supabase Anon Key Accepted (Unexpected Response)",
-                        f"Anon key authenticated against {supabase_url} but table read returned unexpected format.",
-                        "Manually verify RLS is enabled on all tables.",
-                        f"Key: {anon_key[:24]}..."))
-            elif row_resp.status_code == 401:
+                    spec = {}
+                spec_tables = {p.lstrip("/") for p in spec.get("paths", {}) if p not in ("/", "")}
+            else:
+                continue
+
+            # Merge table sources: API spec paths + .from() calls in JS
+            tables_to_probe = spec_tables | js_tables
+            # If no tables found from either source, fall back to common names
+            if not tables_to_probe:
+                tables_to_probe = COMMON_SUPABASE_TABLES
+
+            # Probe each table for anon read access (cap at 20 to stay fast)
+            exposed_tables = []
+            blocked_tables = []
+            not_found_tables = []
+            for table in sorted(tables_to_probe)[:20]:
+                row_resp = session.get(
+                    f"{supabase_url.rstrip('/')}/rest/v1/{table}?select=*&limit=1",
+                    headers=headers, timeout=TIMEOUT, verify=False)
+
+                if row_resp.status_code == 200:
+                    try:
+                        data = row_resp.json()
+                    except Exception:
+                        data = None
+                    if isinstance(data, list):
+                        exposed_tables.append((table, len(data)))
+                elif row_resp.status_code in (401, 403):
+                    blocked_tables.append(table)
+                elif row_resp.status_code == 404:
+                    not_found_tables.append(table)
+
+            # Build per-category table breakdown for evidence
+            evidence_parts = [f"Key: {anon_key[:24]}..."]
+            if exposed_tables:
+                evidence_parts.append("Accessible: " + ", ".join(
+                    f"{t} ({n} row{'s' if n != 1 else ''})" for t, n in exposed_tables))
+            if blocked_tables:
+                evidence_parts.append("Blocked: " + ", ".join(blocked_tables))
+            if not_found_tables:
+                evidence_parts.append("Not found: " + ", ".join(not_found_tables))
+            table_evidence = " | ".join(evidence_parts)
+
+            if exposed_tables:
+                exposed_summary = ", ".join(
+                    f"{t} ({n} row{'s' if n != 1 else ''})" for t, n in exposed_tables)
+                probed.append(("CRITICAL", "Supabase Anon Key Grants Database Read Access",
+                    f"Anon key from client JS can read {len(exposed_tables)} table(s): {exposed_summary}. "
+                    "Row Level Security (RLS) is disabled or overly permissive on these tables.",
+                    "Enable RLS on all Supabase tables. Anon keys are intentionally public — "
+                    "RLS is the only thing preventing public data access.",
+                    table_evidence))
+            elif blocked_tables:
                 probed.append(("PASS", "Supabase RLS Active",
-                    f"Anon key accepted by API but table '{table}' read returned 401 — RLS is enforced.",
-                    None, f"Project: {supabase_url}"))
+                    f"Anon key probed {len(blocked_tables) + len(not_found_tables)} table(s) — "
+                    "all returned 401/403 or 404. RLS is enforced.",
+                    None, table_evidence))
+            else:
+                probed.append(("PASS", "Supabase Anon Key: No Tables Exposed",
+                    "Anon key accepted but no readable tables found via API spec, JS analysis, "
+                    "or common table name probing.",
+                    None, table_evidence))
         except Exception:
             pass
 
@@ -1838,6 +1930,14 @@ def check_db_keys(session, base_url, stealth=False, detected_tech=None):
 # DNS RECONNAISSANCE  (bypasses WAF entirely)
 # ─────────────────────────────────────────────
 
+def _on_wildcard_platform(hostname):
+    """Return the platform name if hostname is a subdomain of a wildcard-DNS platform, else None."""
+    for suffix, name in WILDCARD_DNS_PLATFORMS.items():
+        if hostname.endswith("." + suffix):
+            return name
+    return None
+
+
 def check_dns_recon(hostname):
     """DNS-based recon: SPF, DMARC, MX, subdomain enumeration."""
     results = []
@@ -1851,58 +1951,67 @@ def check_dns_recon(hostname):
     resolver.timeout = 3
     resolver.lifetime = 5
 
-    # ── SPF ──
-    try:
-        answers = resolver.resolve(hostname, "TXT")
-        spf_records = [r.to_text() for r in answers if "v=spf1" in r.to_text()]
-        if not spf_records:
-            results.append(finding("MEDIUM", "No SPF Record Found",
-                "Without SPF, attackers can spoof emails from your domain.",
-                "Add a TXT record: v=spf1 include:... ~all"))
-        else:
-            spf = spf_records[0]
-            if spf.endswith("+all\"") or spf.endswith("+all"):
-                results.append(finding("HIGH", "SPF Record Uses +all (Permissive)",
-                    "'+all' allows anyone to send email as your domain.",
-                    "Replace +all with ~all (soft fail) or -all (hard fail).", spf))
-            elif spf.endswith("-all\"") or spf.endswith("-all"):
-                results.append(finding("PASS", "SPF Record Configured (Strict)",
-                    "SPF uses -all which rejects unauthorised senders.", evidence=spf))
-            else:
-                results.append(finding("LOW", "SPF Record Uses ~all (Soft Fail)",
-                    "Soft fail still allows spoofed emails to be delivered.",
-                    "Consider upgrading to -all for stricter enforcement.", spf))
-    except Exception:
-        results.append(finding("WARN", "SPF Record Lookup Failed",
-            "Could not retrieve TXT records for SPF check."))
+    platform = _on_wildcard_platform(hostname)
 
-    # ── DMARC ──
-    try:
-        dmarc_host = f"_dmarc.{hostname}"
-        answers = resolver.resolve(dmarc_host, "TXT")
-        dmarc_records = [r.to_text() for r in answers if "v=DMARC1" in r.to_text()]
-        if not dmarc_records:
-            results.append(finding("MEDIUM", "No DMARC Record Found",
-                "Without DMARC, spoofed emails from your domain may not be reported or blocked.",
-                "Add: _dmarc TXT \"v=DMARC1; p=quarantine; rua=mailto:dmarc@yourdomain.com\""))
-        else:
-            dmarc = dmarc_records[0]
-            if "p=none" in dmarc:
-                results.append(finding("LOW", "DMARC Policy is 'none' (Monitor Only)",
-                    "p=none means spoofed emails are reported but not blocked.",
-                    "Upgrade to p=quarantine or p=reject once you have reviewed reports.", dmarc))
-            elif "p=reject" in dmarc:
-                results.append(finding("PASS", "DMARC Policy is 'reject' (Strict)",
-                    "Spoofed emails are rejected outright.", evidence=dmarc))
+    # ── SPF / DMARC ──
+    # Skip when the hostname is on a managed platform — user can't set DNS records
+    if platform:
+        results.append(finding("INFO", "SPF/DMARC Checks Skipped",
+            f"DNS records for this hostname are managed by {platform}. "
+            "SPF and DMARC can only be configured by the platform owner, not the site deployer."))
+    else:
+        # ── SPF ──
+        try:
+            answers = resolver.resolve(hostname, "TXT")
+            spf_records = [r.to_text() for r in answers if "v=spf1" in r.to_text()]
+            if not spf_records:
+                results.append(finding("MEDIUM", "No SPF Record Found",
+                    "Without SPF, attackers can spoof emails from your domain.",
+                    "Add a TXT record: v=spf1 include:... ~all"))
             else:
-                results.append(finding("PASS", "DMARC Record Present",
-                    "DMARC configured with quarantine policy.", evidence=dmarc))
-    except dns.exception.DNSException:
-        results.append(finding("MEDIUM", "No DMARC Record Found",
-            "Could not resolve _dmarc record — DMARC is likely not configured.",
-            "Add a DMARC TXT record to your DNS."))
-    except Exception:
-        pass
+                spf = spf_records[0]
+                if spf.endswith("+all\"") or spf.endswith("+all"):
+                    results.append(finding("HIGH", "SPF Record Uses +all (Permissive)",
+                        "'+all' allows anyone to send email as your domain.",
+                        "Replace +all with ~all (soft fail) or -all (hard fail).", spf))
+                elif spf.endswith("-all\"") or spf.endswith("-all"):
+                    results.append(finding("PASS", "SPF Record Configured (Strict)",
+                        "SPF uses -all which rejects unauthorised senders.", evidence=spf))
+                else:
+                    results.append(finding("LOW", "SPF Record Uses ~all (Soft Fail)",
+                        "Soft fail still allows spoofed emails to be delivered.",
+                        "Consider upgrading to -all for stricter enforcement.", spf))
+        except Exception:
+            results.append(finding("WARN", "SPF Record Lookup Failed",
+                "Could not retrieve TXT records for SPF check."))
+
+        # ── DMARC ──
+        try:
+            dmarc_host = f"_dmarc.{hostname}"
+            answers = resolver.resolve(dmarc_host, "TXT")
+            dmarc_records = [r.to_text() for r in answers if "v=DMARC1" in r.to_text()]
+            if not dmarc_records:
+                results.append(finding("MEDIUM", "No DMARC Record Found",
+                    "Without DMARC, spoofed emails from your domain may not be reported or blocked.",
+                    "Add: _dmarc TXT \"v=DMARC1; p=quarantine; rua=mailto:dmarc@yourdomain.com\""))
+            else:
+                dmarc = dmarc_records[0]
+                if "p=none" in dmarc:
+                    results.append(finding("LOW", "DMARC Policy is 'none' (Monitor Only)",
+                        "p=none means spoofed emails are reported but not blocked.",
+                        "Upgrade to p=quarantine or p=reject once you have reviewed reports.", dmarc))
+                elif "p=reject" in dmarc:
+                    results.append(finding("PASS", "DMARC Policy is 'reject' (Strict)",
+                        "Spoofed emails are rejected outright.", evidence=dmarc))
+                else:
+                    results.append(finding("PASS", "DMARC Record Present",
+                        "DMARC configured with quarantine policy.", evidence=dmarc))
+        except dns.exception.DNSException:
+            results.append(finding("MEDIUM", "No DMARC Record Found",
+                "Could not resolve _dmarc record — DMARC is likely not configured.",
+                "Add a DMARC TXT record to your DNS."))
+        except Exception:
+            pass
 
     # ── MX Records ──
     try:
@@ -1915,35 +2024,41 @@ def check_dns_recon(hostname):
         pass
 
     # ── Subdomain Enumeration (DNS brute-force, bypasses WAF) ──
-    live_subs = []
-    for sub in COMMON_SUBDOMAINS:
-        fqdn = f"{sub}.{hostname}"
-        try:
-            addrs = socket.getaddrinfo(fqdn, None)
-            ips = list(set(a[4][0] for a in addrs))
-            live_subs.append((fqdn, ips))
-        except socket.gaierror:
-            pass
-
-    if live_subs:
-        sub_list = ", ".join(f"{fqdn} ({', '.join(ips)})" for fqdn, ips in live_subs[:10])
-        results.append(finding("INFO", f"Live Subdomains Found ({len(live_subs)})",
-            f"Resolving subdomains: {sub_list}",
-            "Ensure all subdomains are intentional and secured. "
-            "Dangling subdomains can be hijacked if their DNS record points to a decommissioned service.",
-            sub_list))
-
-        # Flag dev/staging subdomains specifically
-        risky_subs = [(s, ips) for s, ips in live_subs
-                      if any(kw in s for kw in ["dev.", "staging.", "test.", "beta.", "preview."])]
-        if risky_subs:
-            for fqdn, ips in risky_subs:
-                results.append(finding("MEDIUM", f"Dev/Staging Subdomain Exposed: {fqdn}",
-                    f"Resolves to {', '.join(ips)} — dev environments often have weaker security.",
-                    "Restrict access to staging/dev subdomains via IP allowlist or basic auth."))
+    # Skip on wildcard-DNS platforms where every subdomain resolves by default
+    if platform:
+        results.append(finding("INFO", "Subdomain Enumeration Skipped",
+            f"{platform} uses wildcard DNS — all subdomains resolve regardless of whether "
+            "they are real deployments. Subdomain enumeration is not meaningful here."))
     else:
-        results.append(finding("INFO", "No Common Subdomains Resolved",
-            f"Checked {len(COMMON_SUBDOMAINS)} common subdomains — none resolved."))
+        live_subs = []
+        for sub in COMMON_SUBDOMAINS:
+            fqdn = f"{sub}.{hostname}"
+            try:
+                addrs = socket.getaddrinfo(fqdn, None)
+                ips = list(set(a[4][0] for a in addrs))
+                live_subs.append((fqdn, ips))
+            except socket.gaierror:
+                pass
+
+        if live_subs:
+            sub_list = ", ".join(f"{fqdn} ({', '.join(ips)})" for fqdn, ips in live_subs[:10])
+            results.append(finding("INFO", f"Live Subdomains Found ({len(live_subs)})",
+                f"Resolving subdomains: {sub_list}",
+                "Ensure all subdomains are intentional and secured. "
+                "Dangling subdomains can be hijacked if their DNS record points to a decommissioned service.",
+                sub_list))
+
+            # Flag dev/staging subdomains specifically
+            risky_subs = [(s, ips) for s, ips in live_subs
+                          if any(kw in s for kw in ["dev.", "staging.", "test.", "beta.", "preview."])]
+            if risky_subs:
+                for fqdn, ips in risky_subs:
+                    results.append(finding("MEDIUM", f"Dev/Staging Subdomain Exposed: {fqdn}",
+                        f"Resolves to {', '.join(ips)} — dev environments often have weaker security.",
+                        "Restrict access to staging/dev subdomains via IP allowlist or basic auth."))
+        else:
+            results.append(finding("INFO", "No Common Subdomains Resolved",
+                f"Checked {len(COMMON_SUBDOMAINS)} common subdomains — none resolved."))
 
     return results
 
