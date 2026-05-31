@@ -1,1 +1,6 @@
 *.html
+
+# Local env files — never commit (ADM-041)
+.env
+.env.local
+.env.*.local
