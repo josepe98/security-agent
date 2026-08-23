@@ -5,7 +5,7 @@ Performs passive security checks on websites and generates an interactive HTML r
 Usage: python security_agent.py <url1> [url2] [url3] ...
 """
 
-__version__ = "1.12.1"
+__version__ = "1.12.2"
 
 import sys
 import ssl
